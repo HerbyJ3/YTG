@@ -95,6 +95,31 @@ Without timestamps, `paragraphs()` builds readable prose. It starts a new paragr
 
 File names are sanitized for Windows and macOS, and playlist files get a zero-padded index (`001 - `), so the folder sorts in playlist order.
 
+### Failure logs
+
+A failed run is only useful if you can tell *why* it failed, especially when you're reporting it to someone else or coming back to it a week later. So any run with failures writes a plain-text log to a dedicated folder (`~/Transcript Grabber/Failure Logs` by default).
+
+**What gets captured.** When an attempt fails, the Runner records two extra fields on the `Video`: `attempts` (how many tries it took) and `detail`, which is the **full exception chain**. `_describe()` walks Python's `__cause__`/`__context__` links, so a log shows `ConnectionError: Read timed out <- caused by OSError: connection reset by peer` rather than just the top-level message. The UI still shows the short, friendly reason; the log keeps the whole story.
+
+**What the log contains**, in the order someone debugging needs it:
+
+| Section | Contents |
+|---|---|
+| Context | Source URL, start time, output folder, every option |
+| Environment | App version, Python version, OS, and the installed versions of yt-dlp and youtube-transcript-api. Most real-world failures turn out to be "update the library," and this makes that visible at a glance. |
+| Summary | Counts by status |
+| Failures | Split into **FAILED (can be retried)** and **NO CAPTIONS (nothing to retry)**, because the right action differs |
+| Retry list | Bare URLs, which work directly as input to `--urls-file` |
+| Hints | What to do for the common error types |
+
+**Lifecycle.**
+- **One log per run, named by start time.** Logs sort chronologically, and two runs never overwrite each other.
+- **Written at the end of a run, including a cancelled one,** so the log reflects the final state rather than a half-finished one.
+- **Retries rewrite the same file.** Retrying a video from the UI updates that run's log; if the retries fix everything, the log is deleted. A log on disk always means something is still wrong.
+- **No failures, no file.** The logs folder stays empty for clean runs.
+
+The UI reads the log through `GET /api/log` to show or copy it, and the **Open log** action goes through the same path allowlist as everything else (section 6).
+
 ## 4. Cancellation
 
 Python can't safely kill a thread from outside, so cancellation is **cooperative**. The worker checks a flag at every point where it might be waiting:
@@ -133,7 +158,7 @@ Even a local app deserves a threat model. A web page running on your machine is 
 
 1. **Bind to `127.0.0.1` only.** The server isn't reachable from your network.
 2. **Origin check on every `POST`.** Requests from another site's origin get `403`, so a malicious page can't start jobs or open files.
-3. **Allowlisted file opening.** The **Open file** and **Open folder** actions only open paths this app created during the current run, plus the output folder itself. An arbitrary path like `/etc` is refused.
+3. **Allowlisted file opening.** The **Open file**, **Open folder**, and **Open log** actions only open paths this app created during the current run, plus the output and logs folders themselves. An arbitrary path like `/etc` is refused.
 
 The UI also escapes every value it puts into the page (video titles come from the internet), which prevents HTML injection.
 
@@ -141,15 +166,17 @@ The UI also escapes every value it puts into the page (video titles come from th
 
 The core takes its side effects as parameters: `Runner(fetcher=..., sleeper=..., should_stop=...)`. That's **dependency injection**, and it's what makes the logic testable without YouTube or real time:
 
-- **Unit tests (`test_core.py`, 12 tests, run offline in milliseconds):**
+- **Unit tests (`test_core.py`, 15 tests, run offline in milliseconds):**
   - Parsing video IDs from every URL shape, and sanitizing file names.
   - Output in all three formats, combined files, and paragraph building.
   - Resume (skips files that already exist).
   - Retries and backoff when blocked.
   - Cancellation: mid-run, during a long wait, and with an in-flight result discarded.
+  - Failure logs: contents and the full error chain, no log for a clean run, and a log that updates on retry and disappears once fixed.
 - **End-to-end tests:** a headless Chromium (Playwright) drove the real UI against the real server, with only YouTube swapped for a fake:
   - starting a run, previewing, and retrying,
   - cancelling mid-run, cancelling during playlist listing, and starting a new run right after,
+  - a run with a network failure and a no-caption video, producing the failure log, the red failure bar, and View/Open log,
   - the origin check and the path allowlist,
   - phone-width layout (no horizontal scrolling).
 
@@ -164,7 +191,7 @@ python -m unittest test_core
 1. **Design first.** The UI was designed as a high-fidelity mockup with Higgsfield's image generation (GPT Image), covering the dark theme, amber accent, status chips, and preview pane. The HTML and CSS were then built to match it.
 2. **Core next.** The logic was written behind the injection points above, so it could be tested before any UI existed.
 3. **Interfaces last.** The CLI and the web server are thin wrappers over the core.
-4. **Then iterated:** for example, adding the Cancel button and the generation-counter logic that makes it safe.
+4. **Then iterated:** for example, adding the Cancel button and the generation-counter logic that makes it safe, then failure logs.
 
 The code was written with Claude (Anthropic's AI model) as a pair programmer. Herby set the requirements and the design direction, and reviewed the result; Claude drafted the code, tests, and documentation. Every decision in this document holds on its own engineering merits and can be checked in the code.
 

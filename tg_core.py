@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Callable, Optional
 
 DEFAULT_OUTPUT = str(Path.home() / "Transcript Grabber")
+DEFAULT_LOG_DIR = str(Path.home() / "Transcript Grabber" / "Failure Logs")
+APP_VERSION = "1.1.0"
 FORMATS = {"txt": ".txt", "md": ".md", "json": ".json"}
 
 # ----------------------------------------------------------------- data types
@@ -33,6 +35,8 @@ class Video:
     message: str = ""
     file: str = ""
     language: str = ""
+    detail: str = ""                        # full error text, for the failure log
+    attempts: int = 0
 
     @property
     def url(self) -> str:
@@ -58,6 +62,7 @@ class Options:
     delay: float = 1.5              # seconds between videos (be gentle with YouTube)
     retries: int = 3
     overwrite: bool = False
+    log_dir: str = DEFAULT_LOG_DIR  # where failure logs go
 
 
 @dataclass
@@ -269,6 +274,28 @@ def paragraphs(segs: list[Segment], gap: float = 2.5, max_chars: int = 700) -> s
     return "\n\n".join(out)
 
 
+def _describe(e: BaseException) -> str:
+    """Full, single-line error description, including the underlying cause."""
+    parts, seen = [], set()
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        msg = " ".join(str(e).split())
+        parts.append(f"{type(e).__name__}: {msg}" if msg else type(e).__name__)
+        e = e.__cause__ or e.__context__
+    return " <- caused by ".join(parts)[:2000]
+
+
+def _lib_versions() -> str:
+    out = []
+    for mod, name in (("yt_dlp.version", "yt-dlp"), ("youtube_transcript_api", "youtube-transcript-api")):
+        try:
+            from importlib.metadata import version
+            out.append(f"{name} {version(name)}")
+        except Exception:
+            out.append(f"{name} ?")
+    return ", ".join(out)
+
+
 # ----------------------------------------------------------------- the runner
 
 
@@ -284,7 +311,8 @@ class Runner:
                  on_update: Callable[[Video], None] = lambda v: None,
                  should_stop: Callable[[], bool] = lambda: False,
                  fetcher: Callable = fetch_transcript,
-                 sleeper: Callable[[float], None] = time.sleep):
+                 sleeper: Callable[[float], None] = time.sleep,
+                 source_url: str = ""):
         self.c, self.opts = collection, opts
         self.on_update, self.should_stop = on_update, should_stop
         self.fetcher, self.sleep = fetcher, sleeper
@@ -293,6 +321,9 @@ class Runner:
         self.folder = base / safe_name(collection.title) if collection.is_playlist else base
         self.combined: list[tuple[Video, list[Segment]]] = []
         self.rendered: dict[str, str] = {}   # video_id -> text, for UI previews
+        self.source_url = source_url
+        self.started = time.localtime()
+        self.log_file = ""                   # set once a failure log has been written
 
     def file_for(self, v: Video) -> Path:
         prefix = f"{v.index:03d} - " if self.c.is_playlist else ""
@@ -320,6 +351,7 @@ class Runner:
                     self._set(v, "cancelled", "Cancelled")
         # On cancel, the combined file still gets whatever was fetched.
         combined_file = self._write_combined() if self.opts.combine else ""
+        self.write_failure_log()
         return self.summary(combined_file)
 
     def wait(self, seconds: float, step: float = 0.2) -> None:
@@ -332,6 +364,7 @@ class Runner:
 
     def process(self, v: Video, target: Optional[Path] = None) -> None:
         target = target or self.file_for(v)
+        v.detail, v.attempts = "", 0
         self._set(v, "fetching")
         for attempt in range(1, self.opts.retries + 1):
             if self.should_stop():
@@ -354,14 +387,17 @@ class Runner:
                     self._set(v, "saved", f"{len(segs)} lines", str(target))
                 return
             except NoCaptions as e:
+                v.attempts, v.detail = attempt, _describe(e)
                 self._set(v, "no_captions", str(e))
                 return
             except Blocked as e:
+                v.attempts, v.detail = attempt, _describe(e)
                 if attempt == self.opts.retries:
                     self._set(v, "error", f"Blocked by YouTube: {e}. Wait a while and retry.")
                     return
                 self.wait(15 * attempt)           # back off hard when YouTube pushes back
             except Exception as e:                # network hiccups etc.
+                v.attempts, v.detail = attempt, _describe(e)
                 if attempt == self.opts.retries:
                     self._set(v, "error", f"{type(e).__name__}: {e}"[:300])
                     return
@@ -398,4 +434,85 @@ class Runner:
         counts = {}
         for v in self.c.videos:
             counts[v.status] = counts.get(v.status, 0) + 1
-        return {"folder": str(self.folder), "combined_file": combined_file, "counts": counts}
+        return {"folder": str(self.folder), "combined_file": combined_file, "counts": counts,
+                "log_file": self.log_file}
+
+    # ------------------------------------------------------------- failure log
+
+    def failures(self) -> list:
+        return [v for v in self.c.videos if v.status in ("error", "no_captions")]
+
+    def write_failure_log(self) -> str:
+        """Write (or rewrite) this run's failure log. Returns its path, or "" if nothing failed.
+
+        One file per run, named by start time, so a retry updates the same log
+        instead of creating a new one. If a retry fixes everything, the log is removed.
+        """
+        failed = self.failures()
+        path = Path(os.path.expanduser(self.opts.log_dir)) / (
+            time.strftime("%Y-%m-%d %H%M%S", self.started) + f" - {safe_name(self.c.title, 80)}.log")
+        if not failed:
+            if self.log_file and Path(self.log_file).exists():
+                Path(self.log_file).unlink()
+            self.log_file = ""
+            return ""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(self.render_failure_log(failed), encoding="utf-8")
+        self.log_file = str(path)
+        return self.log_file
+
+    def render_failure_log(self, failed: list) -> str:
+        import platform
+        counts = self.summary_counts()
+        o = self.opts
+        lines = [
+            "TRANSCRIPT GRABBER - FAILURE LOG",
+            "=" * 48,
+            f"Run started : {time.strftime('%Y-%m-%d %H:%M:%S', self.started)}",
+            f"Log written : {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Source      : {self.source_url or '(not recorded)'}",
+            f"Collection  : {self.c.title} ({len(self.c.videos)} video{'s' if len(self.c.videos) != 1 else ''})",
+            f"Output      : {self.folder}",
+            f"Options     : language={o.language}, format={o.fmt}, timestamps={o.timestamps}, "
+            f"combine={o.combine}, retries={o.retries}, delay={o.delay}s",
+            f"Environment : Transcript Grabber {APP_VERSION}, Python {platform.python_version()}, "
+            f"{platform.system()} {platform.release()}, {_lib_versions()}",
+            "",
+            "SUMMARY",
+            "-" * 48,
+            "  " + ", ".join(f"{k.replace('_', ' ')}: {v}" for k, v in sorted(counts.items())),
+            "",
+        ]
+        groups = [("FAILED (can be retried)", [v for v in failed if v.status == "error"]),
+                  ("NO CAPTIONS (nothing to retry)", [v for v in failed if v.status == "no_captions"])]
+        for heading, items in groups:
+            if not items:
+                continue
+            lines += [f"{heading}: {len(items)}", "-" * 48]
+            for v in items:
+                lines += [
+                    f"#{v.index}  {v.title}",
+                    f"    URL      : {v.url}",
+                    f"    Reason   : {v.message or '-'}",
+                    f"    Attempts : {v.attempts}",
+                    f"    Detail   : {v.detail or '-'}",
+                    "",
+                ]
+        retry = [v.url for v in failed if v.status == "error"]
+        if retry:
+            lines += ["RETRY LIST (save as links.txt and run: python transcript_grabber.py --urls-file links.txt)",
+                      "-" * 48, *retry, ""]
+        lines += ["HINTS",
+                  "-" * 48,
+                  "  Blocked / 429 / RequestBlocked : YouTube is throttling this IP. Wait 30-60 minutes, then retry.",
+                  "  Network or proxy errors        : check the internet connection or VPN, then retry.",
+                  "  Anything else                  : update the libraries (re-run the launcher, or",
+                  "                                   pip install -U yt-dlp youtube-transcript-api) and retry.",
+                  ""]
+        return "\n".join(lines)
+
+    def summary_counts(self) -> dict:
+        counts = {}
+        for v in self.c.videos:
+            counts[v.status] = counts.get(v.status, 0) + 1
+        return counts

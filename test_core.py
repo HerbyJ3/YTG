@@ -6,6 +6,8 @@ from pathlib import Path
 
 import tg_core as T
 
+LOGS = tempfile.mkdtemp()   # keep test logs out of the real home folder
+
 
 def fake_fetch(video_id, language="en"):
     if video_id == "nocaptions0":
@@ -33,7 +35,7 @@ class Core(unittest.TestCase):
 
     def run_with(self, **kw):
         tmp = tempfile.mkdtemp()
-        opts = T.Options(output_dir=tmp, delay=0, **kw)
+        opts = T.Options(log_dir=LOGS, output_dir=tmp, delay=0, **kw)
         r = T.Runner(self._col(), opts, fetcher=fake_fetch, sleeper=lambda s: None)
         return r, r.run(), Path(tmp)
 
@@ -49,7 +51,7 @@ class Core(unittest.TestCase):
 
     def test_resume_skips_existing(self):
         r, _, tmp = self.run_with()
-        r2 = T.Runner(self._col(), T.Options(output_dir=str(tmp), delay=0), fetcher=fake_fetch, sleeper=lambda s: None)
+        r2 = T.Runner(self._col(), T.Options(log_dir=LOGS, output_dir=str(tmp), delay=0), fetcher=fake_fetch, sleeper=lambda s: None)
         self.assertEqual(r2.run()["counts"].get("skipped"), 2)
 
     def test_paragraphs_md(self):
@@ -75,7 +77,7 @@ class Core(unittest.TestCase):
             calls.append(vid)
             raise T.Blocked("429")
         col = T.Collection("x", [T.Video(1, "aaaaaaaaaaa", "A")])
-        r = T.Runner(col, T.Options(output_dir=tempfile.mkdtemp(), retries=3), fetcher=blocked, sleeper=lambda s: None)
+        r = T.Runner(col, T.Options(log_dir=LOGS, output_dir=tempfile.mkdtemp(), retries=3), fetcher=blocked, sleeper=lambda s: None)
         r.run()
         self.assertEqual(len(calls), 3)
         self.assertEqual(col.videos[0].status, "error")
@@ -89,7 +91,7 @@ class Core(unittest.TestCase):
             return fake_fetch(vid, lang)
         tmp = tempfile.mkdtemp()
         col = self._col()
-        r = T.Runner(col, T.Options(output_dir=tmp), fetcher=fetch, sleeper=lambda s: None,
+        r = T.Runner(col, T.Options(log_dir=LOGS, output_dir=tmp), fetcher=fetch, sleeper=lambda s: None,
                      should_stop=lambda: stop["flag"])
         res = r.run()
         self.assertEqual([v.status for v in col.videos], ["cancelled"] * 3)
@@ -103,7 +105,7 @@ class Core(unittest.TestCase):
             slept.append(s)
             if len(slept) == 3:
                 stop["flag"] = True
-        r = T.Runner(self._col(), T.Options(output_dir=tempfile.mkdtemp()), fetcher=fake_fetch,
+        r = T.Runner(self._col(), T.Options(log_dir=LOGS, output_dir=tempfile.mkdtemp()), fetcher=fake_fetch,
                      sleeper=sleeper, should_stop=lambda: stop["flag"])
         r.wait(60)
         self.assertEqual(len(slept), 3)              # stopped after ~0.6s, not 60s
@@ -116,12 +118,62 @@ class Core(unittest.TestCase):
             return fake_fetch(vid, lang)
         tmp = tempfile.mkdtemp()
         col = self._col()
-        T.Runner(col, T.Options(output_dir=tmp), fetcher=fetch, sleeper=lambda s: None,
+        T.Runner(col, T.Options(log_dir=LOGS, output_dir=tmp), fetcher=fetch, sleeper=lambda s: None,
                  should_stop=lambda: stop["n"] >= 2).run()
         self.assertEqual([v.status for v in col.videos], ["saved", "no_captions", "cancelled"])
         col2 = self._col()
-        T.Runner(col2, T.Options(output_dir=tmp), fetcher=fake_fetch, sleeper=lambda s: None).run()
+        T.Runner(col2, T.Options(log_dir=LOGS, output_dir=tmp), fetcher=fake_fetch, sleeper=lambda s: None).run()
         self.assertEqual([v.status for v in col2.videos], ["skipped", "no_captions", "saved"])
+
+    def test_failure_log(self):
+        tmp = tempfile.mkdtemp()
+        calls = {"n": 0}
+
+        def fetch(vid, lang):
+            if vid == "bbbbbbbbbbb":
+                calls["n"] += 1
+                raise ConnectionError("proxy said no") from OSError("tunnel 403")
+            return fake_fetch(vid, lang)
+        col = self._col()
+        r = T.Runner(col, T.Options(output_dir=tmp, log_dir=tmp + "/logs", retries=2), fetcher=fetch,
+                     sleeper=lambda s: None, source_url="https://www.youtube.com/playlist?list=PLx")
+        res = r.run()
+        log = Path(res["log_file"])
+        self.assertEqual(log.parent, Path(tmp) / "logs")
+        text = log.read_text()
+        self.assertIn("Source      : https://www.youtube.com/playlist?list=PLx", text)
+        self.assertIn("FAILED (can be retried): 1", text)
+        self.assertIn("NO CAPTIONS (nothing to retry): 1", text)
+        self.assertIn("ConnectionError: proxy said no <- caused by OSError: tunnel 403", text)
+        self.assertIn("Attempts : 2", text)
+        self.assertIn("https://www.youtube.com/watch?v=bbbbbbbbbbb", text.split("RETRY LIST")[1])
+        self.assertNotIn("nocaptions0", text.split("RETRY LIST")[1])   # no-caption videos aren't retryable
+
+    def test_no_log_when_everything_works(self):
+        tmp = tempfile.mkdtemp()
+        col = T.Collection("ok", [T.Video(1, "aaaaaaaaaaa", "A")])
+        res = T.Runner(col, T.Options(output_dir=tmp, log_dir=tmp + "/logs"), fetcher=fake_fetch,
+                       sleeper=lambda s: None).run()
+        self.assertEqual(res["log_file"], "")
+        self.assertFalse((Path(tmp) / "logs").exists())
+
+    def test_retry_updates_then_removes_log(self):
+        tmp = tempfile.mkdtemp()
+        state = {"fail": True}
+
+        def fetch(vid, lang):
+            if state["fail"]:
+                raise TimeoutError("slow")
+            return fake_fetch(vid, lang)
+        col = T.Collection("one", [T.Video(1, "aaaaaaaaaaa", "A")])
+        r = T.Runner(col, T.Options(output_dir=tmp, log_dir=tmp + "/logs", retries=1), fetcher=fetch,
+                     sleeper=lambda s: None)
+        log = r.run()["log_file"]
+        self.assertTrue(Path(log).exists())
+        state["fail"] = False
+        r.process(col.videos[0])
+        self.assertEqual(r.write_failure_log(), "")      # fixed by retry: log removed
+        self.assertFalse(Path(log).exists())
 
     def test_durations(self):
         self.assertEqual(T.fmt_duration(754), "12:34")

@@ -22,7 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from tg_core import DEFAULT_OUTPUT, FORMATS, Options, Runner, list_videos
+from tg_core import DEFAULT_LOG_DIR, DEFAULT_OUTPUT, FORMATS, Options, Runner, list_videos
 
 STATIC = Path(__file__).resolve().parent / "static"
 
@@ -72,7 +72,7 @@ class Job:
                 return                                  # cancelled while reading the playlist
             if not col.videos:
                 raise ValueError("No videos found at that URL.")
-            runner = Runner(col, opts, should_stop=stop.is_set)
+            runner = Runner(col, opts, should_stop=stop.is_set, source_url=url)
             with self.lock:
                 if not self._current(gen):
                     return
@@ -112,6 +112,7 @@ class Job:
         def work():
             self.runner.process(v)
             combined = self.runner._write_combined() if self.runner.opts.combine else self.result.get("combined_file", "")
+            self.runner.write_failure_log()          # update (or remove) this run's log
             with self.lock:
                 if self._current(gen):
                     self.result = self.runner.summary(combined)
@@ -128,6 +129,8 @@ class Job:
                 "title": self.collection.title if self.collection else "",
                 "folder": str(self.runner.folder) if self.runner else "",
                 "combined_file": self.result.get("combined_file", ""),
+                "log_file": self.runner.log_file if self.runner else "",
+                "log_dir": self.runner.opts.log_dir if self.runner else "",
                 "total": len(vids), "finished": finished, "videos": vids,
             }
 
@@ -188,9 +191,13 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif u.path == "/api/config":
-            self._json({"output_dir": DEFAULT_OUTPUT, "formats": list(FORMATS)})
+            self._json({"output_dir": DEFAULT_OUTPUT, "log_dir": DEFAULT_LOG_DIR, "formats": list(FORMATS)})
         elif u.path == "/api/status":
             self._json(JOB.status())
+        elif u.path == "/api/log":
+            f = JOB.runner.log_file if JOB.runner else ""
+            text = Path(f).read_text(encoding="utf-8", errors="replace") if f and Path(f).exists() else ""
+            self._json({"path": f, "text": text})
         elif u.path == "/api/preview":
             idx = int(parse_qs(u.query).get("index", ["0"])[0])
             self._json({"text": self._preview(idx)})
@@ -215,7 +222,8 @@ class Handler(BaseHTTPRequestHandler):
                                combine=bool(data.get("combine", False)),
                                fmt=fmt if fmt in FORMATS else "txt",
                                output_dir=(data.get("output_dir") or DEFAULT_OUTPUT).strip(),
-                               overwrite=bool(data.get("overwrite", False)))
+                               overwrite=bool(data.get("overwrite", False)),
+                               log_dir=(data.get("log_dir") or DEFAULT_LOG_DIR).strip())
                 JOB.start(url, opts)
                 return self._json({"ok": True})
             if path in ("/api/cancel", "/api/stop"):
@@ -249,9 +257,12 @@ class Handler(BaseHTTPRequestHandler):
         allowed = set()
         if JOB.runner:
             allowed.add(str(JOB.runner.folder))
+            if JOB.runner.log_file:
+                allowed.add(JOB.runner.log_file)
             allowed.update(v.file for v in JOB.collection.videos if v.file)
         if not target:
-            folder = Path(os.path.expanduser(data.get("folder") or DEFAULT_OUTPUT))
+            default = DEFAULT_LOG_DIR if data.get("kind") == "logs" else DEFAULT_OUTPUT
+            folder = Path(os.path.expanduser(data.get("folder") or default))
             folder.mkdir(parents=True, exist_ok=True)
             target = str(folder)
             allowed.add(target)

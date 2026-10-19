@@ -13,7 +13,7 @@ Run `python app.py` instead for the point-and-click version.
 import argparse
 import sys
 
-from tg_core import DEFAULT_OUTPUT, Options, Runner, list_videos
+from tg_core import DEFAULT_LOG_DIR, DEFAULT_OUTPUT, Options, Runner, list_videos
 
 ICONS = {"saved": "OK  ", "skipped": "SKIP", "no_captions": "NONE", "error": "FAIL", "fetching": "... "}
 
@@ -23,6 +23,7 @@ def main(argv=None) -> int:
     p.add_argument("urls", nargs="*", help="Video, playlist, or channel URL(s)")
     p.add_argument("--urls-file", help="Text file with one URL per line")
     p.add_argument("--out", default=DEFAULT_OUTPUT, help=f"Output folder (default: {DEFAULT_OUTPUT})")
+    p.add_argument("--log-dir", default=DEFAULT_LOG_DIR, help=f"Where failure logs go (default: {DEFAULT_LOG_DIR})")
     p.add_argument("--format", choices=["txt", "md", "json"], default="txt")
     p.add_argument("--lang", default="en", help='Language code, e.g. en, es, fr, or "any" (default: en)')
     p.add_argument("--no-timestamps", action="store_true", help="Write flowing paragraphs instead of timestamped lines")
@@ -40,7 +41,8 @@ def main(argv=None) -> int:
         return 1
 
     opts = Options(language=a.lang, timestamps=not a.no_timestamps, combine=a.combine,
-                   fmt=a.format, output_dir=a.out, delay=a.delay, overwrite=a.overwrite)
+                   fmt=a.format, output_dir=a.out, delay=a.delay, overwrite=a.overwrite,
+                   log_dir=a.log_dir)
     failures = 0
     for url in urls:
         print(f"\nLooking up {url} ...")
@@ -61,7 +63,7 @@ def main(argv=None) -> int:
                 line += f"  ({v.message})"
             print(line, flush=True)
 
-        result = Runner(col, opts, on_update=show).run()
+        result = Runner(col, opts, on_update=show, source_url=url).run()
         c = result["counts"]
         failures += c.get("error", 0)
         print(f"\n  Saved {c.get('saved', 0)}, skipped {c.get('skipped', 0)}, "
@@ -69,6 +71,8 @@ def main(argv=None) -> int:
         print(f"  Folder: {result['folder']}")
         if result["combined_file"]:
             print(f"  Combined file: {result['combined_file']}")
+        if result["log_file"]:
+            print(f"  Failure log: {result['log_file']}")
     return 1 if failures else 0
 
 

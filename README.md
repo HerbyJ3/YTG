@@ -15,6 +15,7 @@ Everything runs on your own computer through a simple web page in your browser. 
 - **Live progress:** see where the run is, preview each transcript as it arrives, and retry anything that failed.
 - **Cancel anytime:** use the **Cancel** button or press **Esc**. Nothing already saved is lost.
 - **Resume:** run the same playlist again and it skips what you already have.
+- **Failure logs:** when anything fails, a detailed log is saved automatically. It records what failed, why, the full error, and a ready-made retry list. You can view, copy, or open it right from the app.
 
 ## Start it
 
@@ -34,6 +35,17 @@ You'll need Python 3.9 or newer (python.org). On Windows, tick "Add python.exe t
 
 Files go to `~/Transcript Grabber` by default (you can change this in the app). A playlist gets its own subfolder, with files numbered in playlist order: `001 - Title.txt`.
 
+### When something fails
+
+![A failure log shown in the preview pane](docs/failure-log.png)
+
+If any video fails or has no captions, the app saves a **failure log** to `~/Transcript Grabber/Failure Logs` (change it under **Failure logs** in the app). A red bar under the progress area tells you what happened and gives you three buttons:
+- **View log:** shows the log in the preview pane.
+- **Open log:** opens the file in your text editor.
+- **Copy log:** puts the whole log on your clipboard, ready to paste into an email, an issue, or a chat.
+
+Each log lists the run's settings and environment (app, Python, and library versions), a summary, every failed video with its reason, number of attempts, and full error chain, and a **retry list** of URLs you can feed back in with `--urls-file`. There's one log per run, named by date and time. Retrying a video from the app updates that same log, and if the retries fix everything, the log is removed.
+
 ## Command line
 
 ```
@@ -43,7 +55,7 @@ python transcript_grabber.py URL --combine --lang es
 python transcript_grabber.py --urls-file links.txt
 ```
 
-Run `python transcript_grabber.py --help` to see every option. Press Ctrl+C to stop.
+Run `python transcript_grabber.py --help` to see every option. Press Ctrl+C to stop. Use `--log-dir` to choose where failure logs go; the path of any log is printed at the end of the run.
 
 ## Good to know
 

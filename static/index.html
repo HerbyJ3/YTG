@@ -59,6 +59,11 @@ select:focus{outline:0;border-color:var(--amber)}
 .btn-cancel:disabled{opacity:.6;cursor:default;background:none}
 .btn-cancel[hidden]{display:none}
 .banner.info{display:block;background:var(--gray-soft);color:#cfd3db}
+.logbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:10px;padding:9px 12px;border-radius:8px;background:var(--red-soft);color:#ffb3b5;font-size:13px}
+.logbar[hidden]{display:none}
+.logbtns{display:flex;gap:6px;flex-wrap:wrap}
+.mini{height:26px;padding:0 10px;border-radius:7px;border:1px solid rgba(242,85,90,.5);background:transparent;color:#ffc9cb;cursor:pointer;font-size:12px;font-weight:500}
+.mini:hover{background:rgba(242,85,90,.18)}
 .btn-main:disabled{opacity:.6;cursor:default}
 .btn-ghost{height:32px;padding:0 12px;border-radius:8px;border:1px solid var(--amber);background:transparent;color:var(--amber);display:inline-flex;align-items:center;gap:7px;cursor:pointer;font-weight:500;white-space:nowrap}
 .btn-ghost:hover{background:var(--amber-soft)}
@@ -180,6 +185,14 @@ select:focus{outline:0;border-color:var(--amber)}
           </button>
         </div>
         <div id="banner" class="banner"></div>
+        <div id="logbar" class="logbar" hidden>
+          <span id="logmsg"></span>
+          <span class="logbtns">
+            <button id="viewLog" class="mini">View log</button>
+            <button id="openLog" class="mini">Open log</button>
+            <button id="copyLog" class="mini">Copy log</button>
+          </span>
+        </div>
       </section>
 
       <section class="card">
@@ -200,6 +213,17 @@ select:focus{outline:0;border-color:var(--amber)}
           <button id="openFolder" class="btn-ghost">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
             Open folder
+          </button>
+        </div>
+        <label class="lbl" for="logdir" style="margin-top:16px">Failure logs</label>
+        <div class="folder-row">
+          <div class="field">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h4"/></svg>
+            <input id="logdir" spellcheck="false">
+          </div>
+          <button id="openLogs" class="btn-ghost">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+            Open logs
           </button>
         </div>
       </section>
@@ -232,7 +256,7 @@ const LABEL = { saved:"Saved", skipped:"Already saved", fetching:"Fetching", que
 const ACTIVE = ["listing","running","cancelling"];
 const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
-function savePrefs(){ try{ localStorage.setItem("tg-prefs", JSON.stringify({lang:$("#lang").value, ts:$("#ts").checked, combine:$("#combine").checked, fmt:state.fmt, out:$("#out").value})); }catch(e){} }
+function savePrefs(){ try{ localStorage.setItem("tg-prefs", JSON.stringify({lang:$("#lang").value, ts:$("#ts").checked, combine:$("#combine").checked, fmt:state.fmt, out:$("#out").value, logdir:$("#logdir").value})); }catch(e){} }
 function loadPrefs(){ try{ return JSON.parse(localStorage.getItem("tg-prefs")||"{}"); }catch(e){ return {}; } }
 
 async function api(path, body){
@@ -245,7 +269,7 @@ function banner(msg, kind="err"){ const b=$("#banner"); b.className = msg ? "ban
 
 function setFmt(f){ state.fmt=f; document.querySelectorAll(".pill").forEach(p=>p.setAttribute("aria-pressed", p.dataset.fmt===f)); savePrefs(); }
 document.querySelectorAll(".pill").forEach(p=>p.onclick=()=>setFmt(p.dataset.fmt));
-["#lang","#ts","#combine","#out"].forEach(s=>$(s).addEventListener("change", savePrefs));
+["#lang","#ts","#combine","#out","#logdir"].forEach(s=>$(s).addEventListener("change", savePrefs));
 
 $("#go").onclick = async () => {
   if (state.running) return;
@@ -253,8 +277,8 @@ $("#go").onclick = async () => {
   const url = $("#url").value.trim();
   if (!url){ banner("Paste a video or playlist URL first."); $("#url").focus(); return; }
   try{
-    await api("/api/start", {url, language:$("#lang").value, timestamps:$("#ts").checked, combine:$("#combine").checked, format:state.fmt, output_dir:$("#out").value});
-    state.selected=null; state.lastPreviewKey=""; showPreviewPlaceholder();
+    await api("/api/start", {url, language:$("#lang").value, timestamps:$("#ts").checked, combine:$("#combine").checked, format:state.fmt, output_dir:$("#out").value, log_dir:$("#logdir").value});
+    state.selected=null; state.lastPreviewKey=""; showPreviewPlaceholder(); $("#logbar").hidden = true;
     startPolling();
   }catch(e){ banner(e.message); }
 };
@@ -274,6 +298,37 @@ $("#openFolder").onclick = async () => {
   catch(e){ try{ await api("/api/open", {folder:$("#out").value}); }catch(e2){ banner(e2.message); } }
 };
 
+$("#openLogs").onclick = async () => {
+  try{ await api("/api/open", {kind:"logs", folder:$("#logdir").value}); }catch(e){ banner(e.message); }
+};
+$("#viewLog").onclick = async () => {
+  const {text, path} = await api("/api/log").catch(()=>({text:""}));
+  if (!text) return;
+  state.selected = null; state.lastPreviewKey = "log";
+  document.querySelectorAll(".row").forEach(r=>r.classList.remove("sel"));
+  state.previewText = text;
+  $("#prevTitle").textContent = "Failure log";
+  $("#copy").hidden = false;
+  $("#preview").textContent = text;
+};
+$("#openLog").onclick = async () => { try{ await api("/api/open", {path:state.logFile}); }catch(e){ banner(e.message); } };
+$("#copyLog").onclick = async () => {
+  const {text} = await api("/api/log").catch(()=>({text:""}));
+  try{ await navigator.clipboard.writeText(text); $("#copyLog").textContent="Copied"; setTimeout(()=>$("#copyLog").textContent="Copy log",1200); }catch(e){}
+};
+
+function renderLogbar(s){
+  state.logFile = s.log_file;
+  const bad = s.videos.filter(v=>v.status==="error").length, none = s.videos.filter(v=>v.status==="no_captions").length;
+  const show = !ACTIVE.includes(s.stage) && !!s.log_file;
+  $("#logbar").hidden = !show;
+  if (!show) return;
+  const parts = [];
+  if (bad) parts.push(`${bad} failed`);
+  if (none) parts.push(`${none} had no captions`);
+  $("#logmsg").textContent = parts.join(", ") + ". Details saved to the failure log.";
+}
+
 function startPolling(){ clearInterval(state.polling); poll(); state.polling = setInterval(poll, 800); }
 
 async function poll(){
@@ -283,7 +338,9 @@ async function poll(){
   setRunning(s.stage);
   renderProgress(s);
   renderList(s.videos);
+  renderLogbar(s);
   if (state.selected!=null) refreshPreview();
+  else if (state.lastPreviewKey==="log") {}
   else { const first = s.videos.find(v=>v.status==="saved"); if (first) selectRow(first.index); }
   if (s.stage==="error"){ banner(s.error); }
   if (!active){
@@ -401,6 +458,7 @@ $("#menu").addEventListener("click", async e=>{
   const p = loadPrefs();
   let cfg = {output_dir:""}; try{ cfg = await api("/api/config"); }catch(e){}
   $("#out").value = p.out || cfg.output_dir;
+  $("#logdir").value = p.logdir || cfg.log_dir || "";
   if (p.lang) $("#lang").value = p.lang;
   if (p.ts!==undefined) $("#ts").checked = p.ts;
   if (p.combine!==undefined) $("#combine").checked = p.combine;
