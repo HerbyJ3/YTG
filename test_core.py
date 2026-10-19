@@ -1,0 +1,132 @@
+"""Offline tests: python -m unittest test_core  (no network needed)."""
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+import tg_core as T
+
+
+def fake_fetch(video_id, language="en"):
+    if video_id == "nocaptions0":
+        raise T.NoCaptions("TranscriptsDisabled")
+    return ([T.Segment(1.0, 2.0, "Hello there."), T.Segment(3.5, 2.0, "Second  line\nwraps."),
+             T.Segment(70.0, 2.0, "After a pause.")], language)
+
+
+class Core(unittest.TestCase):
+    def test_video_ids(self):
+        self.assertEqual(T.extract_video_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=3"), "dQw4w9WgXcQ")
+        self.assertEqual(T.extract_video_id("https://youtu.be/dQw4w9WgXcQ"), "dQw4w9WgXcQ")
+        self.assertEqual(T.extract_video_id("https://youtube.com/shorts/dQw4w9WgXcQ"), "dQw4w9WgXcQ")
+        self.assertTrue(T.is_playlist_url("https://www.youtube.com/playlist?list=PL123"))
+        self.assertTrue(T.is_playlist_url("https://www.youtube.com/@somechannel/videos"))
+        self.assertFalse(T.is_playlist_url("https://youtu.be/dQw4w9WgXcQ"))
+
+    def test_safe_name(self):
+        self.assertEqual(T.safe_name('a/b:c*d?"e<f>g|h. '), "abcdefgh")
+
+    def _col(self):
+        return T.Collection("My: List", [T.Video(1, "aaaaaaaaaaa", "First / One", 754),
+                                         T.Video(2, "nocaptions0", "Second", 60),
+                                         T.Video(3, "bbbbbbbbbbb", "Third", 3700)], is_playlist=True)
+
+    def run_with(self, **kw):
+        tmp = tempfile.mkdtemp()
+        opts = T.Options(output_dir=tmp, delay=0, **kw)
+        r = T.Runner(self._col(), opts, fetcher=fake_fetch, sleeper=lambda s: None)
+        return r, r.run(), Path(tmp)
+
+    def test_txt_playlist(self):
+        r, res, tmp = self.run_with()
+        folder = tmp / "My List"
+        files = sorted(p.name for p in folder.iterdir())
+        self.assertEqual(files, ["001 - First One.txt", "003 - Third.txt"])
+        text = (folder / "001 - First One.txt").read_text()
+        self.assertIn("[00:00:01] Hello there.", text)
+        self.assertIn("[00:00:03] Second line wraps.", text)
+        self.assertEqual(res["counts"], {"saved": 2, "no_captions": 1})
+
+    def test_resume_skips_existing(self):
+        r, _, tmp = self.run_with()
+        r2 = T.Runner(self._col(), T.Options(output_dir=str(tmp), delay=0), fetcher=fake_fetch, sleeper=lambda s: None)
+        self.assertEqual(r2.run()["counts"].get("skipped"), 2)
+
+    def test_paragraphs_md(self):
+        _, _, tmp = self.run_with(timestamps=False, fmt="md")
+        text = (tmp / "My List" / "003 - Third.md").read_text()
+        self.assertIn("Hello there. Second line wraps.\n\nAfter a pause.", text)
+        self.assertTrue(text.startswith("# Third"))
+
+    def test_md_timestamps_link(self):
+        _, _, tmp = self.run_with(fmt="md")
+        self.assertIn("&t=70s) After a pause.", (tmp / "My List" / "003 - Third.md").read_text())
+
+    def test_combined_json(self):
+        _, res, tmp = self.run_with(combine=True, fmt="json")
+        data = json.loads(Path(res["combined_file"]).read_text())
+        self.assertEqual([v["title"] for v in data["videos"]], ["First / One", "Third"])
+        self.assertEqual(len(list((tmp / "My List").iterdir())), 1)
+
+    def test_blocked_retries_then_fails(self):
+        calls = []
+
+        def blocked(vid, lang):
+            calls.append(vid)
+            raise T.Blocked("429")
+        col = T.Collection("x", [T.Video(1, "aaaaaaaaaaa", "A")])
+        r = T.Runner(col, T.Options(output_dir=tempfile.mkdtemp(), retries=3), fetcher=blocked, sleeper=lambda s: None)
+        r.run()
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(col.videos[0].status, "error")
+
+    def test_cancel_mid_run(self):
+        stop = {"flag": False}
+
+        def fetch(vid, lang):
+            if vid == "aaaaaaaaaaa":
+                stop["flag"] = True          # user hits Cancel while this request is in flight
+            return fake_fetch(vid, lang)
+        tmp = tempfile.mkdtemp()
+        col = self._col()
+        r = T.Runner(col, T.Options(output_dir=tmp), fetcher=fetch, sleeper=lambda s: None,
+                     should_stop=lambda: stop["flag"])
+        res = r.run()
+        self.assertEqual([v.status for v in col.videos], ["cancelled"] * 3)
+        self.assertEqual(list((Path(tmp) / "My List").iterdir()), [])   # in-flight result discarded
+
+    def test_cancel_interrupts_wait(self):
+        slept = []
+        stop = {"flag": False}
+
+        def sleeper(s):
+            slept.append(s)
+            if len(slept) == 3:
+                stop["flag"] = True
+        r = T.Runner(self._col(), T.Options(output_dir=tempfile.mkdtemp()), fetcher=fake_fetch,
+                     sleeper=sleeper, should_stop=lambda: stop["flag"])
+        r.wait(60)
+        self.assertEqual(len(slept), 3)              # stopped after ~0.6s, not 60s
+
+    def test_cancel_keeps_saved_and_resumes(self):
+        stop = {"n": 0}
+
+        def fetch(vid, lang):
+            stop["n"] += 1
+            return fake_fetch(vid, lang)
+        tmp = tempfile.mkdtemp()
+        col = self._col()
+        T.Runner(col, T.Options(output_dir=tmp), fetcher=fetch, sleeper=lambda s: None,
+                 should_stop=lambda: stop["n"] >= 2).run()
+        self.assertEqual([v.status for v in col.videos], ["saved", "no_captions", "cancelled"])
+        col2 = self._col()
+        T.Runner(col2, T.Options(output_dir=tmp), fetcher=fake_fetch, sleeper=lambda s: None).run()
+        self.assertEqual([v.status for v in col2.videos], ["skipped", "no_captions", "saved"])
+
+    def test_durations(self):
+        self.assertEqual(T.fmt_duration(754), "12:34")
+        self.assertEqual(T.fmt_duration(3700), "1:01:40")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transcript Grabber</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#0c0e12; --card:#14171d; --card-2:#101318; --line:#232731; --line-2:#2c313c;
+  --text:#e8eaef; --muted:#9097a4; --faint:#5f6672;
+  --amber:#f5a524; --amber-ink:#1a1204; --amber-soft:rgba(245,165,36,.14);
+  --green:#3fcf72; --green-soft:rgba(63,207,114,.13);
+  --red:#f2555a; --red-soft:rgba(242,85,90,.14);
+  --gray-soft:rgba(144,151,164,.14);
+  --r:12px;
+  --sans:"Inter",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,"Cascadia Code",Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 var(--sans);-webkit-font-smoothing:antialiased}
+button,input,select{font:inherit;color:inherit}
+.wrap{max-width:1320px;margin:0 auto;padding:22px 32px 40px}
+header{display:flex;align-items:center;gap:12px;margin:4px 0 22px}
+header h1{font-size:19px;font-weight:700;margin:0;letter-spacing:-.01em}
+.grid{display:grid;grid-template-columns:minmax(0,1fr) 440px;gap:16px;align-items:start}
+.col{display:flex;flex-direction:column;gap:16px;min-width:0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:20px}
+label.lbl,.lbl{display:block;font-size:13px;font-weight:500;color:#cfd3db;margin-bottom:8px}
+.field{display:flex;align-items:center;gap:10px;background:var(--card-2);border:1px solid var(--line-2);border-radius:9px;padding:0 12px;height:40px;transition:border-color .15s}
+.field:focus-within{border-color:var(--amber)}
+.field svg{flex:none;color:var(--faint)}
+.field input{flex:1;min-width:0;background:none;border:0;outline:0;height:100%}
+.field input::placeholder{color:var(--faint)}
+.opts{display:grid;grid-template-columns:170px 1fr 1fr auto;gap:18px;margin:18px 0 22px;align-items:end}
+select{appearance:none;width:100%;height:36px;background:var(--card-2) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='none' stroke='%239097a4' stroke-width='1.8'%3E%3Cpath d='M3 4.5l3 3 3-3'/%3E%3C/svg%3E") no-repeat right 10px center;border:1px solid var(--line-2);border-radius:8px;padding:0 30px 0 10px;cursor:pointer}
+select:focus{outline:0;border-color:var(--amber)}
+.toggle{position:relative;width:34px;height:20px;display:inline-block;cursor:pointer;margin:8px 0}
+.toggle input{position:absolute;opacity:0;inset:0;margin:0;cursor:pointer}
+.toggle span{position:absolute;inset:0;border-radius:20px;background:#2f343f;transition:.18s}
+.toggle span::after{content:"";position:absolute;top:3px;left:3px;width:14px;height:14px;border-radius:50%;background:#8b919c;transition:.18s}
+.toggle input:checked+span{background:var(--amber)}
+.toggle input:checked+span::after{left:17px;background:#3a2606}
+.toggle input:focus-visible+span{outline:2px solid var(--amber);outline-offset:2px}
+.pills{display:flex;gap:8px}
+.pill{height:30px;padding:0 16px;border-radius:30px;border:1px solid var(--line-2);background:transparent;cursor:pointer;font-weight:500;color:#d6d9e0;transition:.15s}
+.pill:hover{border-color:#454b58}
+.pill[aria-pressed=true]{background:var(--amber);border-color:var(--amber);color:var(--amber-ink)}
+.btn-main{width:100%;height:38px;border:0;border-radius:8px;background:var(--amber);color:var(--amber-ink);font-weight:600;cursor:pointer;transition:filter .15s,transform .05s}
+.btn-main:hover{filter:brightness(1.07)}
+.btn-main:active{transform:translateY(1px)}
+.actions{display:flex;gap:10px}
+.actions .btn-main{flex:1}
+.btn-main.working{background:#2a2e38;color:var(--text);display:inline-flex;align-items:center;justify-content:center;gap:9px}
+.btn-main.working::before{content:"";width:13px;height:13px;border-radius:50%;border:2px solid #6b7180;border-top-color:var(--amber);animation:spin .8s linear infinite}
+.btn-cancel{height:38px;padding:0 18px;border-radius:8px;border:1px solid rgba(242,85,90,.55);background:transparent;color:#ff8a8e;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:8px;transition:.15s}
+.btn-cancel:hover{background:var(--red-soft);border-color:var(--red)}
+.btn-cancel:disabled{opacity:.6;cursor:default;background:none}
+.btn-cancel[hidden]{display:none}
+.banner.info{display:block;background:var(--gray-soft);color:#cfd3db}
+.btn-main:disabled{opacity:.6;cursor:default}
+.btn-ghost{height:32px;padding:0 12px;border-radius:8px;border:1px solid var(--amber);background:transparent;color:var(--amber);display:inline-flex;align-items:center;gap:7px;cursor:pointer;font-weight:500;white-space:nowrap}
+.btn-ghost:hover{background:var(--amber-soft)}
+.banner{display:none;margin-top:14px;padding:10px 12px;border-radius:8px;font-size:13px}
+.banner.err{display:block;background:var(--red-soft);color:#ffb3b5}
+.banner.ok{display:block;background:var(--green-soft);color:#a6f0c1}
+.prog-head{display:flex;justify-content:space-between;font-weight:600;font-size:13px;margin-bottom:10px}
+.prog-head .sub{color:var(--muted);font-weight:500;margin-left:8px}
+.bar{height:5px;background:#252a34;border-radius:5px;overflow:hidden;margin-bottom:10px}
+.bar i{display:block;height:100%;width:0;background:var(--amber);border-radius:5px;transition:width .35s}
+.list{max-height:calc(100vh - 430px);min-height:120px;overflow:auto;margin:0 -6px}
+.row{display:grid;grid-template-columns:34px 52px minmax(0,1fr) 70px 150px 28px;align-items:center;gap:12px;padding:6px 6px;border-bottom:1px solid #1d2028;cursor:pointer;border-radius:6px}
+.row:last-child{border-bottom:0}
+.row:hover{background:#181c23}
+.row.sel{background:#1b1f27;box-shadow:inset 2px 0 0 var(--amber)}
+.row .n{color:var(--muted);text-align:center;font-size:13px}
+.row img{width:38px;height:28px;object-fit:cover;border-radius:4px;background:#222;display:block;margin:0 auto}
+.row .t{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row .d{color:#c4c8d0;font-variant-numeric:tabular-nums;font-size:13px}
+.chip{display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 10px;border-radius:6px;font-size:12px;font-weight:500;white-space:nowrap}
+.chip.saved,.chip.skipped{background:var(--green-soft);color:var(--green)}
+.chip.fetching{background:var(--amber-soft);color:var(--amber)}
+.chip.queued,.chip.cancelled{background:var(--gray-soft);color:#a3a9b4}
+.chip.no_captions,.chip.error{background:var(--red-soft);color:var(--red)}
+.chip.fetching svg{animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.kebab{width:26px;height:26px;border:0;background:none;border-radius:6px;color:#c9ccd3;cursor:pointer;display:grid;place-items:center}
+.kebab:hover{background:#262a33}
+.menu{position:fixed;z-index:10;background:#1b1e25;border:1px solid var(--line-2);border-radius:9px;padding:5px;min-width:150px;box-shadow:0 12px 30px rgba(0,0,0,.45);display:none}
+.menu button{display:block;width:100%;text-align:left;background:none;border:0;padding:7px 10px;border-radius:6px;cursor:pointer}
+.menu button:hover{background:#262a33}
+.menu button:disabled{opacity:.4;cursor:default;background:none}
+.empty{color:var(--faint);text-align:center;padding:34px 10px}
+.folder-row{display:flex;gap:10px}
+.folder-row .field{flex:1;height:36px}
+.preview{background:var(--card-2);border:1px solid var(--line);border-radius:9px;padding:14px 16px;font:12.5px/1.75 var(--mono);color:#cfd3da;height:calc(100vh - 260px);min-height:300px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+.preview .ts{color:var(--muted)}
+.preview .ph{color:var(--faint);font-family:var(--sans);font-size:13px}
+.prev-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px}
+.prev-head .lbl{margin:0}
+.prev-head small{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.copy{border:1px solid var(--line-2);background:none;border-radius:7px;height:26px;padding:0 10px;cursor:pointer;color:#cfd3db;font-size:12px;flex:none}
+.copy:hover{border-color:#454b58}
+@media (max-width:1000px){
+  .grid{grid-template-columns:1fr}
+  .opts{grid-template-columns:1fr 1fr}
+  .list,.preview{max-height:none;height:auto}
+  .preview{min-height:240px;max-height:420px}
+}
+@media (max-width:560px){
+  .wrap{padding:16px}
+  .opts > div:last-child{grid-column:1 / -1}
+  .folder-row{flex-wrap:wrap}
+  .folder-row .field{flex-basis:100%}
+  .row{grid-template-columns:26px minmax(0,1fr) auto 26px}
+  .row img,.row .d{display:none}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <!-- original mark: speech bubble with text lines -->
+    <svg width="30" height="30" viewBox="0 0 30 30" aria-hidden="true">
+      <path d="M7 3h16a4 4 0 0 1 4 4v11a4 4 0 0 1-4 4H13l-6 5v-5a4 4 0 0 1-4-4V7a4 4 0 0 1 4-4z" fill="#f5a524"/>
+      <rect x="8.5" y="8.5" width="13" height="2" rx="1" fill="#1a1204"/>
+      <rect x="8.5" y="12.5" width="13" height="2" rx="1" fill="#1a1204"/>
+      <rect x="8.5" y="16.5" width="8" height="2" rx="1" fill="#1a1204"/>
+    </svg>
+    <h1>Transcript Grabber</h1>
+  </header>
+
+  <div class="grid">
+    <div class="col">
+      <section class="card">
+        <label class="lbl" for="url">Video or playlist URL</label>
+        <div class="field">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></svg>
+          <input id="url" type="url" placeholder="Paste a YouTube video, playlist, or channel URL here..." autocomplete="off" spellcheck="false">
+        </div>
+
+        <div class="opts">
+          <div>
+            <label class="lbl" for="lang">Language</label>
+            <select id="lang">
+              <option value="en">English</option>
+              <option value="es">Spanish</option>
+              <option value="fr">French</option>
+              <option value="de">German</option>
+              <option value="pt">Portuguese</option>
+              <option value="it">Italian</option>
+              <option value="ht">Haitian Creole</option>
+              <option value="any">Any available</option>
+            </select>
+          </div>
+          <div>
+            <span class="lbl">Include timestamps</span>
+            <label class="toggle"><input id="ts" type="checkbox" checked aria-label="Include timestamps"><span></span></label>
+          </div>
+          <div>
+            <span class="lbl">Combine into one file</span>
+            <label class="toggle"><input id="combine" type="checkbox" aria-label="Combine into one file"><span></span></label>
+          </div>
+          <div>
+            <span class="lbl">Output format</span>
+            <div class="pills" role="group" aria-label="Output format">
+              <button class="pill" data-fmt="txt" aria-pressed="true">TXT</button>
+              <button class="pill" data-fmt="md" aria-pressed="false">Markdown</button>
+              <button class="pill" data-fmt="json" aria-pressed="false">JSON</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button id="go" class="btn-main">Get transcripts</button>
+          <button id="cancel" class="btn-cancel" hidden title="Stop now (Esc)">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+            <span>Cancel</span>
+          </button>
+        </div>
+        <div id="banner" class="banner"></div>
+      </section>
+
+      <section class="card">
+        <div class="prog-head"><span><span id="count">No videos yet</span><span id="sub" class="sub"></span></span><span id="pct"></span></div>
+        <div class="bar"><i id="barfill"></i></div>
+        <div id="list" class="list"><div class="empty">Paste a URL above and press Get transcripts.<br>Playlists and channels are expanded automatically.</div></div>
+      </section>
+    </div>
+
+    <div class="col">
+      <section class="card">
+        <label class="lbl" for="out">Output folder</label>
+        <div class="folder-row">
+          <div class="field">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+            <input id="out" spellcheck="false">
+          </div>
+          <button id="openFolder" class="btn-ghost">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+            Open folder
+          </button>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="prev-head"><span class="lbl">Preview</span><small id="prevTitle"></small><button id="copy" class="copy" hidden>Copy</button></div>
+        <div id="preview" class="preview"><span class="ph">Select a saved video to see its transcript here.</span></div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<div id="menu" class="menu" role="menu">
+  <button data-act="preview">Preview</button>
+  <button data-act="open">Open file</button>
+  <button data-act="watch">Open video</button>
+  <button data-act="retry">Retry</button>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const state = { fmt: "txt", selected: null, videos: [], polling: null, lastPreviewKey: "", menuIdx: null, running: false };
+const ICON = {
+  saved:'<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><circle cx="12" cy="12" r="9"/><path d="M8 12.5l2.7 2.7L16 9.8"/></svg>',
+  fetching:'<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-3-6.7"/></svg>',
+  queued:'<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
+  bad:'<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6M15 9l-6 6"/></svg>'
+};
+const LABEL = { saved:"Saved", skipped:"Already saved", fetching:"Fetching", queued:"Queued", no_captions:"No captions", error:"Failed", cancelled:"Cancelled" };
+const ACTIVE = ["listing","running","cancelling"];
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+function savePrefs(){ try{ localStorage.setItem("tg-prefs", JSON.stringify({lang:$("#lang").value, ts:$("#ts").checked, combine:$("#combine").checked, fmt:state.fmt, out:$("#out").value})); }catch(e){} }
+function loadPrefs(){ try{ return JSON.parse(localStorage.getItem("tg-prefs")||"{}"); }catch(e){ return {}; } }
+
+async function api(path, body){
+  const r = await fetch(path, body === undefined ? {} : {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+  const j = await r.json().catch(()=>({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+function banner(msg, kind="err"){ const b=$("#banner"); b.className = msg ? "banner "+kind : "banner"; b.textContent = msg||""; }
+
+function setFmt(f){ state.fmt=f; document.querySelectorAll(".pill").forEach(p=>p.setAttribute("aria-pressed", p.dataset.fmt===f)); savePrefs(); }
+document.querySelectorAll(".pill").forEach(p=>p.onclick=()=>setFmt(p.dataset.fmt));
+["#lang","#ts","#combine","#out"].forEach(s=>$(s).addEventListener("change", savePrefs));
+
+$("#go").onclick = async () => {
+  if (state.running) return;
+  banner("");
+  const url = $("#url").value.trim();
+  if (!url){ banner("Paste a video or playlist URL first."); $("#url").focus(); return; }
+  try{
+    await api("/api/start", {url, language:$("#lang").value, timestamps:$("#ts").checked, combine:$("#combine").checked, format:state.fmt, output_dir:$("#out").value});
+    state.selected=null; state.lastPreviewKey=""; showPreviewPlaceholder();
+    startPolling();
+  }catch(e){ banner(e.message); }
+};
+$("#url").addEventListener("keydown", e=>{ if(e.key==="Enter") $("#go").click(); });
+
+async function cancelRun(){
+  if (!state.running) return;
+  const c=$("#cancel"); c.disabled=true; c.querySelector("span").textContent="Cancelling...";
+  try{ await api("/api/cancel", {}); }catch(e){ banner(e.message); }
+  poll();
+}
+$("#cancel").onclick = cancelRun;
+document.addEventListener("keydown", e=>{ if(e.key==="Escape" && state.running && $("#menu").style.display!=="block") cancelRun(); });
+
+$("#openFolder").onclick = async () => {
+  try{ await api("/api/open", state.folder ? {path:state.folder} : {folder:$("#out").value}); }
+  catch(e){ try{ await api("/api/open", {folder:$("#out").value}); }catch(e2){ banner(e2.message); } }
+};
+
+function startPolling(){ clearInterval(state.polling); poll(); state.polling = setInterval(poll, 800); }
+
+async function poll(){
+  let s; try{ s = await api("/api/status"); }catch(e){ return; }
+  state.videos = s.videos; state.folder = s.folder;
+  const active = ACTIVE.includes(s.stage);
+  setRunning(s.stage);
+  renderProgress(s);
+  renderList(s.videos);
+  if (state.selected!=null) refreshPreview();
+  else { const first = s.videos.find(v=>v.status==="saved"); if (first) selectRow(first.index); }
+  if (s.stage==="error"){ banner(s.error); }
+  if (!active){
+    clearInterval(state.polling);
+    const ok = s.videos.filter(v=>v.status==="saved"||v.status==="skipped").length;
+    const where = s.combined_file ? s.combined_file : s.folder;
+    if (s.stage==="done"){
+      banner(`Done. ${ok} of ${s.total} transcripts saved to ${where}`, ok? "ok":"err");
+    } else if (s.stage==="cancelled"){
+      banner(s.total ? `Cancelled. ${ok} of ${s.total} transcripts were saved to ${where}. Run it again to pick up where you left off.`
+                     : "Cancelled.", "info");
+      if (!s.total){ $("#list").innerHTML='<div class="empty">Cancelled before any videos were fetched.</div>'; }
+    }
+  }
+}
+
+function setRunning(stage){
+  const on = ACTIVE.includes(stage);
+  state.running = on;
+  const b=$("#go"), c=$("#cancel");
+  b.disabled = on;
+  b.classList.toggle("working", on);
+  b.textContent = stage==="listing" ? "Reading the URL..." : stage==="cancelling" ? "Finishing the current video..." : on ? "Getting transcripts..." : "Get transcripts";
+  c.hidden = !on;
+  c.disabled = stage==="cancelling";
+  c.querySelector("span").textContent = stage==="cancelling" ? "Cancelling..." : "Cancel";
+}
+
+function renderProgress(s){
+  if (s.stage==="listing"){ $("#count").textContent="Reading the URL..."; $("#sub").textContent=""; $("#pct").textContent=""; $("#barfill").style.width="0"; return; }
+  if (!s.total){ $("#count").textContent="No videos yet"; $("#sub").textContent=""; $("#pct").textContent=""; $("#barfill").style.width="0"; return; }
+  const pct = Math.round(100*s.finished/s.total);
+  $("#count").textContent = `${s.finished} of ${s.total} video${s.total>1?"s":""}`;
+  $("#sub").textContent = s.title ? "· "+s.title : "";
+  $("#pct").textContent = pct+"%";
+  $("#barfill").style.width = pct+"%";
+}
+
+function chip(v){
+  const ic = v.status==="saved"||v.status==="skipped" ? ICON.saved : v.status==="fetching" ? ICON.fetching : v.status==="queued" ? ICON.queued : ICON.bad;
+  return `<span class="chip ${v.status}" title="${esc(v.message||"")}">${ic}${LABEL[v.status]||v.status}</span>`;
+}
+
+function renderList(videos){
+  const list=$("#list");
+  if (!videos.length){ if(!state.running) return; list.innerHTML='<div class="empty">Looking up videos...</div>'; return; }
+  const top = list.scrollTop;
+  list.innerHTML = videos.map(v=>`
+    <div class="row${state.selected===v.index?" sel":""}" data-i="${v.index}">
+      <span class="n">${v.index}</span>
+      <img src="${esc(v.thumbnail)}" alt="" loading="lazy" onerror="this.style.visibility='hidden'">
+      <span class="t" title="${esc(v.title)}">${esc(v.title)}</span>
+      <span class="d">${esc(v.duration_text||"")}</span>
+      <span>${chip(v)}</span>
+      <button class="kebab" data-menu="${v.index}" aria-label="More actions"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="12" cy="19" r="1.8"/></svg></button>
+    </div>`).join("");
+  list.scrollTop = top;
+}
+
+$("#list").addEventListener("click", e=>{
+  const k = e.target.closest(".kebab");
+  if (k){ e.stopPropagation(); openMenu(+k.dataset.menu, k); return; }
+  const r = e.target.closest(".row"); if (r) selectRow(+r.dataset.i);
+});
+
+function selectRow(i){
+  state.selected=i; state.lastPreviewKey="";
+  document.querySelectorAll(".row").forEach(r=>r.classList.toggle("sel", +r.dataset.i===i));
+  refreshPreview();
+}
+
+function showPreviewPlaceholder(msg){ $("#preview").innerHTML=`<span class="ph">${esc(msg||"Select a saved video to see its transcript here.")}</span>`; $("#prevTitle").textContent=""; $("#copy").hidden=true; }
+
+async function refreshPreview(){
+  const v = state.videos.find(x=>x.index===state.selected); if(!v) return;
+  const key = v.index+":"+v.status+":"+v.file;
+  if (key===state.lastPreviewKey) return;
+  state.lastPreviewKey = key;
+  $("#prevTitle").textContent = v.title;
+  if (v.status==="no_captions"||v.status==="error"){ showPreviewPlaceholder((v.status==="error"?"Couldn't fetch this one: ":"This video has no captions: ")+(v.message||"")); $("#prevTitle").textContent=v.title; return; }
+  if (v.status==="cancelled"){ showPreviewPlaceholder("Cancelled before this one was fetched."); $("#prevTitle").textContent=v.title; return; }
+  if (v.status!=="saved" && v.status!=="skipped"){ showPreviewPlaceholder("Waiting for this transcript..."); $("#prevTitle").textContent=v.title; return; }
+  const {text} = await api("/api/preview?index="+v.index).catch(()=>({text:""}));
+  state.previewText = text;
+  $("#copy").hidden = !text;
+  $("#preview").innerHTML = text ? esc(text).replace(/^\[(\d\d:\d\d:\d\d)\]/gm, '<span class="ts">[$1]</span>') : '<span class="ph">No preview available.</span>';
+}
+
+$("#copy").onclick = async ()=>{ try{ await navigator.clipboard.writeText(state.previewText||""); $("#copy").textContent="Copied"; setTimeout(()=>$("#copy").textContent="Copy",1200);}catch(e){} };
+
+function openMenu(i, anchor){
+  const m=$("#menu"), v=state.videos.find(x=>x.index===i); state.menuIdx=i;
+  m.querySelector('[data-act=open]').disabled = !v.file;
+  m.querySelector('[data-act=preview]').disabled = !(v.status==="saved"||v.status==="skipped");
+  m.querySelector('[data-act=retry]').disabled = state.running || v.status==="fetching";
+  m.style.display="block";
+  const r=anchor.getBoundingClientRect();
+  m.style.top = Math.min(r.bottom+4, innerHeight-m.offsetHeight-8)+"px";
+  m.style.left = Math.max(8, r.right-m.offsetWidth)+"px";
+}
+document.addEventListener("click", e=>{ if(!e.target.closest("#menu")) $("#menu").style.display="none"; });
+$("#menu").addEventListener("click", async e=>{
+  const b=e.target.closest("button"); if(!b||b.disabled) return;
+  $("#menu").style.display="none";
+  const v=state.videos.find(x=>x.index===state.menuIdx);
+  try{
+    if (b.dataset.act==="preview") selectRow(v.index);
+    if (b.dataset.act==="open") await api("/api/open", {path:v.file});
+    if (b.dataset.act==="watch") window.open(v.url, "_blank", "noopener");
+    if (b.dataset.act==="retry"){ await api("/api/retry", {index:v.index}); banner(""); startPolling(); }
+  }catch(err){ banner(err.message); }
+});
+
+(async function init(){
+  const p = loadPrefs();
+  let cfg = {output_dir:""}; try{ cfg = await api("/api/config"); }catch(e){}
+  $("#out").value = p.out || cfg.output_dir;
+  if (p.lang) $("#lang").value = p.lang;
+  if (p.ts!==undefined) $("#ts").checked = p.ts;
+  if (p.combine!==undefined) $("#combine").checked = p.combine;
+  if (p.fmt) setFmt(p.fmt);
+  poll();   // picks up a run that was already going if the page was refreshed
+})();
+</script>
+</body>
+</html>
