@@ -15,6 +15,7 @@ Everything runs on your own computer through a simple web page in your browser. 
 - **Live progress:** see where the run is, preview each transcript as it arrives, and retry anything that failed.
 - **Cancel anytime:** use the **Cancel** button or press **Esc**. Nothing already saved is lost.
 - **Resume:** run the same playlist again and it skips what you already have.
+- **Hard to block:** if YouTube blocks the fast caption method, it switches to yt-dlp automatically. It can also use your browser's YouTube cookies for stubborn cases.
 - **Failure logs:** when anything fails, a detailed log is saved automatically. It records what failed, why, the full error, and a ready-made retry list. You can view, copy, or open it right from the app.
 
 ## Start it
@@ -46,6 +47,18 @@ If any video fails or has no captions, the app saves a **failure log** to `~/Tra
 
 Each log lists the run's settings and environment (app, Python, and library versions), a summary, every failed video with its reason, number of attempts, and full error chain, and a **retry list** of URLs you can feed back in with `--urls-file`. There's one log per run, named by date and time. Retrying a video from the app updates that same log, and if the retries fix everything, the log is removed.
 
+### When YouTube blocks you
+
+YouTube sometimes refuses caption requests, even from a home connection; the log will say *"YouTube is blocking requests from this IP."* The app handles most of this on its own:
+
+1. **Automatic fallback.** Captions are fetched with a fast, lightweight library first. If YouTube blocks it, the app switches to **yt-dlp**, a full YouTube extractor that's much harder to block, for the rest of the run.
+2. **Browser cookies.** If a video is still blocked, choose a browser under **If YouTube blocks you** (Firefox works most reliably), then press **Retry** on that video. yt-dlp then uses the YouTube sign-in from that browser. Close the browser first; some browsers lock their cookie files while open. Chrome and Edge on Windows encrypt their cookies in a way that can stop this from working, so use Firefox if they fail.
+3. **Wait it out.** Blocks are temporary. Wait 30–60 minutes and run it again; anything already saved is skipped.
+
+Also make sure no VPN is on, since VPN addresses are blocked far more often.
+
+The launcher installs **Deno**, the JavaScript runtime yt-dlp needs to work fully with YouTube. If the app warns that it's missing, close it and run the launcher again.
+
 ## Command line
 
 ```
@@ -53,6 +66,8 @@ python transcript_grabber.py "PLAYLIST_OR_VIDEO_URL"
 python transcript_grabber.py URL --format md --no-timestamps --out "D:\Transcripts"
 python transcript_grabber.py URL --combine --lang es
 python transcript_grabber.py --urls-file links.txt
+python transcript_grabber.py URL --cookies-from-browser firefox
+python transcript_grabber.py URL --source ytdlp
 ```
 
 Run `python transcript_grabber.py --help` to see every option. Press Ctrl+C to stop. Use `--log-dir` to choose where failure logs go; the path of any log is printed at the end of the run.

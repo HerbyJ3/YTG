@@ -13,7 +13,7 @@ Run `python app.py` instead for the point-and-click version.
 import argparse
 import sys
 
-from tg_core import DEFAULT_LOG_DIR, DEFAULT_OUTPUT, Options, Runner, list_videos
+from tg_core import BROWSERS, DEFAULT_LOG_DIR, DEFAULT_OUTPUT, Options, Runner, list_videos
 
 ICONS = {"saved": "OK  ", "skipped": "SKIP", "no_captions": "NONE", "error": "FAIL", "fetching": "... "}
 
@@ -24,6 +24,10 @@ def main(argv=None) -> int:
     p.add_argument("--urls-file", help="Text file with one URL per line")
     p.add_argument("--out", default=DEFAULT_OUTPUT, help=f"Output folder (default: {DEFAULT_OUTPUT})")
     p.add_argument("--log-dir", default=DEFAULT_LOG_DIR, help=f"Where failure logs go (default: {DEFAULT_LOG_DIR})")
+    p.add_argument("--source", choices=["auto", "api", "ytdlp"], default="auto",
+                   help="How to fetch captions: auto (transcript library, falling back to yt-dlp), api, or ytdlp")
+    p.add_argument("--cookies-from-browser", choices=BROWSERS, metavar="BROWSER",
+                   help="Use your browser's YouTube cookies when YouTube blocks requests (firefox works best)")
     p.add_argument("--format", choices=["txt", "md", "json"], default="txt")
     p.add_argument("--lang", default="en", help='Language code, e.g. en, es, fr, or "any" (default: en)')
     p.add_argument("--no-timestamps", action="store_true", help="Write flowing paragraphs instead of timestamped lines")
@@ -42,7 +46,7 @@ def main(argv=None) -> int:
 
     opts = Options(language=a.lang, timestamps=not a.no_timestamps, combine=a.combine,
                    fmt=a.format, output_dir=a.out, delay=a.delay, overwrite=a.overwrite,
-                   log_dir=a.log_dir)
+                   log_dir=a.log_dir, source=a.source, cookies_browser=a.cookies_from_browser or "")
     failures = 0
     for url in urls:
         print(f"\nLooking up {url} ...")

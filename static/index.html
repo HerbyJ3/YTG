@@ -59,6 +59,10 @@ select:focus{outline:0;border-color:var(--amber)}
 .btn-cancel:disabled{opacity:.6;cursor:default;background:none}
 .btn-cancel[hidden]{display:none}
 .banner.info{display:block;background:var(--gray-soft);color:#cfd3db}
+.unblock{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px}
+.note{margin:12px 0 0;font-size:12px;color:var(--amber);line-height:1.5}
+.note[hidden]{display:none}
+@media (max-width:560px){.unblock{grid-template-columns:1fr}}
 .logbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:10px;padding:9px 12px;border-radius:8px;background:var(--red-soft);color:#ffb3b5;font-size:13px}
 .logbar[hidden]{display:none}
 .logbtns{display:flex;gap:6px;flex-wrap:wrap}
@@ -226,6 +230,27 @@ select:focus{outline:0;border-color:var(--amber)}
             Open logs
           </button>
         </div>
+        <div class="unblock">
+          <div>
+            <label class="lbl" for="cookies">If YouTube blocks you</label>
+            <select id="cookies" title="Lets yt-dlp use your browser's YouTube sign-in. Close that browser first.">
+              <option value="">Off</option>
+              <option value="firefox">Firefox cookies</option>
+              <option value="edge">Edge cookies</option>
+              <option value="chrome">Chrome cookies</option>
+              <option value="brave">Brave cookies</option>
+            </select>
+          </div>
+          <div>
+            <label class="lbl" for="source">Caption method</label>
+            <select id="source">
+              <option value="auto">Automatic</option>
+              <option value="ytdlp">yt-dlp only</option>
+              <option value="api">Library only</option>
+            </select>
+          </div>
+        </div>
+        <p id="rtnote" class="note" hidden></p>
       </section>
 
       <section class="card">
@@ -256,7 +281,7 @@ const LABEL = { saved:"Saved", skipped:"Already saved", fetching:"Fetching", que
 const ACTIVE = ["listing","running","cancelling"];
 const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
-function savePrefs(){ try{ localStorage.setItem("tg-prefs", JSON.stringify({lang:$("#lang").value, ts:$("#ts").checked, combine:$("#combine").checked, fmt:state.fmt, out:$("#out").value, logdir:$("#logdir").value})); }catch(e){} }
+function savePrefs(){ try{ localStorage.setItem("tg-prefs", JSON.stringify({lang:$("#lang").value, ts:$("#ts").checked, combine:$("#combine").checked, fmt:state.fmt, out:$("#out").value, logdir:$("#logdir").value, cookies:$("#cookies").value, source:$("#source").value})); }catch(e){} }
 function loadPrefs(){ try{ return JSON.parse(localStorage.getItem("tg-prefs")||"{}"); }catch(e){ return {}; } }
 
 async function api(path, body){
@@ -269,7 +294,7 @@ function banner(msg, kind="err"){ const b=$("#banner"); b.className = msg ? "ban
 
 function setFmt(f){ state.fmt=f; document.querySelectorAll(".pill").forEach(p=>p.setAttribute("aria-pressed", p.dataset.fmt===f)); savePrefs(); }
 document.querySelectorAll(".pill").forEach(p=>p.onclick=()=>setFmt(p.dataset.fmt));
-["#lang","#ts","#combine","#out","#logdir"].forEach(s=>$(s).addEventListener("change", savePrefs));
+["#lang","#ts","#combine","#out","#logdir","#cookies","#source"].forEach(s=>$(s).addEventListener("change", savePrefs));
 
 $("#go").onclick = async () => {
   if (state.running) return;
@@ -277,7 +302,7 @@ $("#go").onclick = async () => {
   const url = $("#url").value.trim();
   if (!url){ banner("Paste a video or playlist URL first."); $("#url").focus(); return; }
   try{
-    await api("/api/start", {url, language:$("#lang").value, timestamps:$("#ts").checked, combine:$("#combine").checked, format:state.fmt, output_dir:$("#out").value, log_dir:$("#logdir").value});
+    await api("/api/start", {url, language:$("#lang").value, timestamps:$("#ts").checked, combine:$("#combine").checked, format:state.fmt, output_dir:$("#out").value, log_dir:$("#logdir").value, cookies_browser:$("#cookies").value, source:$("#source").value});
     state.selected=null; state.lastPreviewKey=""; showPreviewPlaceholder(); $("#logbar").hidden = true;
     startPolling();
   }catch(e){ banner(e.message); }
@@ -326,7 +351,10 @@ function renderLogbar(s){
   const parts = [];
   if (bad) parts.push(`${bad} failed`);
   if (none) parts.push(`${none} had no captions`);
-  $("#logmsg").textContent = parts.join(", ") + ". Details saved to the failure log.";
+  const blocked = s.videos.some(v=>v.status==="error" && /blocking requests/i.test(v.message||""));
+  let tip = "";
+  if (blocked && !$("#cookies").value) tip = " Tip: pick a browser under \u201cIf YouTube blocks you\u201d, then Retry.";
+  $("#logmsg").textContent = parts.join(", ") + ". Details saved to the failure log." + tip;
 }
 
 function startPolling(){ clearInterval(state.polling); poll(); state.polling = setInterval(poll, 800); }
@@ -450,7 +478,7 @@ $("#menu").addEventListener("click", async e=>{
     if (b.dataset.act==="preview") selectRow(v.index);
     if (b.dataset.act==="open") await api("/api/open", {path:v.file});
     if (b.dataset.act==="watch") window.open(v.url, "_blank", "noopener");
-    if (b.dataset.act==="retry"){ await api("/api/retry", {index:v.index}); banner(""); startPolling(); }
+    if (b.dataset.act==="retry"){ await api("/api/retry", {index:v.index, source:$("#source").value, cookies_browser:$("#cookies").value}); banner(""); startPolling(); }
   }catch(err){ banner(err.message); }
 });
 
@@ -459,6 +487,12 @@ $("#menu").addEventListener("click", async e=>{
   let cfg = {output_dir:""}; try{ cfg = await api("/api/config"); }catch(e){}
   $("#out").value = p.out || cfg.output_dir;
   $("#logdir").value = p.logdir || cfg.log_dir || "";
+  if (p.cookies) $("#cookies").value = p.cookies;
+  if (p.source) $("#source").value = p.source;
+  if (cfg.js_runtime === "none"){
+    const n=$("#rtnote"); n.hidden=false;
+    n.textContent = "yt-dlp's JavaScript helper (Deno) isn't installed, so blocked videos are more likely to fail. Close this window and re-run the launcher to install it.";
+  }
   if (p.lang) $("#lang").value = p.lang;
   if (p.ts!==undefined) $("#ts").checked = p.ts;
   if (p.combine!==undefined) $("#combine").checked = p.combine;

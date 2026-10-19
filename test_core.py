@@ -175,6 +175,78 @@ class Core(unittest.TestCase):
         self.assertEqual(r.write_failure_log(), "")      # fixed by retry: log removed
         self.assertFalse(Path(log).exists())
 
+    # ---- caption fallback (yt-dlp) -------------------------------------
+
+    def test_parse_json3(self):
+        raw = json.dumps({"events": [
+            {"tStartMs": 1200, "dDurationMs": 2500, "segs": [{"utf8": "Hello "}, {"utf8": "world"}]},
+            {"tStartMs": 3700, "dDurationMs": 10, "aAppend": 1, "segs": [{"utf8": "\n"}]},   # newline-only event
+            {"tStartMs": 4000},                                                              # window event, no text
+            {"tStartMs": 65000, "dDurationMs": 2000, "segs": [{"utf8": "Second\nline"}]},
+        ]})
+        segs = T.parse_json3(raw)
+        self.assertEqual([(s.start, s.text) for s in segs], [(1.2, "Hello world"), (65.0, "Second line")])
+
+    def test_pick_track(self):
+        j3 = [{"ext": "vtt", "url": "v"}, {"ext": "json3", "url": "j"}]
+        info = {"subtitles": {"live_chat": j3, "es": j3},
+                "automatic_captions": {"en-orig": j3, "en": j3, "fr": j3}}
+        self.assertEqual(T._pick_track(info, "es")[1], "es")      # manual wins
+        self.assertEqual(T._pick_track(info, "en")[1], "en")      # original-language auto captions
+        self.assertEqual(T._pick_track(info, "fr")[1], "fr")      # auto-translated track
+        self.assertEqual(T._pick_track(info, "de"), (None, ""))
+        self.assertEqual(T._pick_track(info, "any")[1], "es")     # manual first, never live chat
+        self.assertEqual(T._pick_track({"subtitles": {"en-US": j3}}, "en")[1], "en-US")
+        self.assertEqual(T._pick_track({"automatic_captions": {"pt-orig": j3}}, "any")[1], "pt")
+
+    def test_fallback_when_api_blocked_and_sticky(self):
+        calls = []
+
+        def api(vid, lang):
+            calls.append(("api", vid))
+            raise T.Blocked("IpBlocked")
+
+        def ytdlp(vid, lang):
+            calls.append(("ytdlp", vid))
+            return fake_fetch(vid, lang)
+        f = T.SmartFetcher("auto", api=api, ytdlp=ytdlp)
+        tmp = tempfile.mkdtemp()
+        col = T.Collection("x", [T.Video(1, "aaaaaaaaaaa", "A"), T.Video(2, "bbbbbbbbbbb", "B")], is_playlist=True)
+        res = T.Runner(col, T.Options(output_dir=tmp, log_dir=tmp + "/logs"), fetcher=f, sleeper=lambda s: None).run()
+        self.assertEqual(res["counts"], {"saved": 2})
+        # the blocked library is tried once, then skipped for the rest of the run
+        self.assertEqual(calls, [("api", "aaaaaaaaaaa"), ("ytdlp", "aaaaaaaaaaa"), ("ytdlp", "bbbbbbbbbbb")])
+        self.assertEqual(col.videos[0].source, "transcript-api blocked -> yt-dlp")
+        self.assertTrue(col.videos[1].source.startswith("yt-dlp"))
+
+    def test_api_no_captions_is_trusted(self):
+        hit = []
+
+        def api(vid, lang):
+            raise T.NoCaptions("TranscriptsDisabled")
+        f = T.SmartFetcher("auto", api=api, ytdlp=lambda v, l: hit.append(v))
+        with self.assertRaises(T.NoCaptions):
+            f("aaaaaaaaaaa")
+        self.assertEqual(hit, [])
+
+    def test_both_blocked_logs_method_and_clear_reason(self):
+        def blocked(vid, lang):
+            raise T.Blocked("Sign in to confirm you're not a bot")
+        tmp = tempfile.mkdtemp()
+        col = T.Collection("one", [T.Video(1, "aaaaaaaaaaa", "A")])
+        r = T.Runner(col, T.Options(output_dir=tmp, log_dir=tmp + "/logs", retries=2),
+                     fetcher=T.SmartFetcher("auto", api=blocked, ytdlp=blocked), sleeper=lambda s: None)
+        text = Path(r.run()["log_file"]).read_text()
+        v = col.videos[0]
+        self.assertEqual(v.status, "error")
+        self.assertNotIn(": .", v.message)                 # the old "Blocked by YouTube: ." bug
+        self.assertIn("turn on browser cookies", v.message)
+        self.assertIn("Method   : yt-dlp (transcript-api was blocked earlier this run)", text)
+        self.assertIn("JS runtime:", text)
+
+    def test_first_line_skips_blank_lines(self):
+        self.assertEqual(T._first_line(Exception("\n\n  Could not retrieve\nmore")), "Could not retrieve")
+
     def test_durations(self):
         self.assertEqual(T.fmt_duration(754), "12:34")
         self.assertEqual(T.fmt_duration(3700), "1:01:40")

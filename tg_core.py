@@ -17,9 +17,19 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Callable, Optional
 
+import sys
+
+# Tools installed into this Python environment (e.g. the Deno runtime from
+# `pip install yt-dlp[deno]`) live next to the interpreter. Windows doesn't put
+# that folder on PATH unless the venv is activated, so add it here for yt-dlp.
+_ENV_BIN = os.path.dirname(sys.executable)
+if _ENV_BIN not in os.environ.get("PATH", "").split(os.pathsep):
+    os.environ["PATH"] = _ENV_BIN + os.pathsep + os.environ.get("PATH", "")
+
 DEFAULT_OUTPUT = str(Path.home() / "Transcript Grabber")
 DEFAULT_LOG_DIR = str(Path.home() / "Transcript Grabber" / "Failure Logs")
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
+BROWSERS = ("firefox", "chrome", "edge", "brave", "chromium", "opera", "vivaldi", "safari")
 FORMATS = {"txt": ".txt", "md": ".md", "json": ".json"}
 
 # ----------------------------------------------------------------- data types
@@ -36,6 +46,7 @@ class Video:
     file: str = ""
     language: str = ""
     detail: str = ""                        # full error text, for the failure log
+    source: str = ""                        # which fetch method was used / tried
     attempts: int = 0
 
     @property
@@ -63,6 +74,8 @@ class Options:
     retries: int = 3
     overwrite: bool = False
     log_dir: str = DEFAULT_LOG_DIR  # where failure logs go
+    source: str = "auto"            # auto | api | ytdlp  (how captions are fetched)
+    cookies_browser: str = ""       # "", firefox, chrome, edge, brave... (yt-dlp only)
 
 
 @dataclass
@@ -219,7 +232,7 @@ def fetch_transcript(video_id: str, language: str = "en") -> tuple[list[Segment]
                     raise
         fetched = transcript.fetch()
     except blocked as e:
-        raise Blocked(str(e).splitlines()[0] if str(e) else "YouTube is blocking requests") from e
+        raise Blocked(_first_line(e) or "YouTube is blocking requests from this IP") from e
     except none as e:
         raise NoCaptions(type(e).__name__) from e
     except StopIteration as e:
@@ -230,6 +243,149 @@ def fetch_transcript(video_id: str, language: str = "en") -> tuple[list[Segment]
     if not segs:
         raise NoCaptions("Transcript is empty")
     return segs, transcript.language_code
+
+
+def _first_line(e: BaseException) -> str:
+    """First non-empty line of an exception message (library messages often start with a blank line)."""
+    return next((ln.strip() for ln in str(e).splitlines() if ln.strip()), "")
+
+
+_BLOCK_HINTS = ("sign in to confirm", "not a bot", "http error 429", "too many requests",
+                "http error 403", "unable to download api page", "blocked")
+_GONE_HINTS = ("private video", "video unavailable", "this video is unavailable", "has been removed",
+               "members-only", "join this channel", "age-restricted", "inappropriate")
+
+
+def _pick_track(info: dict, language: str):
+    """Choose a caption track from yt-dlp's info dict. Returns (formats, language_code) or (None, "")."""
+    manual = {k: v for k, v in (info.get("subtitles") or {}).items() if k != "live_chat" and v}
+    auto = {k: v for k, v in (info.get("automatic_captions") or {}).items() if v}
+
+    if language == "any":
+        if manual:
+            k = next(iter(manual))
+            return manual[k], k
+        orig = next((k for k in auto if k.endswith("-orig")), None) or next(iter(auto), None)
+        return (auto[orig], orig.replace("-orig", "")) if orig else (None, "")
+
+    def find(d, keys):
+        for k in keys:
+            if k in d:
+                return k
+        return next((k for k in d if k.split("-")[0] == language and not k.endswith("-orig")), None)
+
+    k = find(manual, [language])
+    if k:
+        return manual[k], k
+    k = find(auto, [f"{language}-orig", language])     # original-language auto captions, then translations
+    if k:
+        return auto[k], k.replace("-orig", "")
+    return None, ""
+
+
+def parse_json3(raw) -> list:
+    """Parse YouTube's json3 caption format into Segments."""
+    data = json.loads(raw)
+    segs = []
+    for ev in data.get("events", []):
+        text = "".join(seg.get("utf8", "") for seg in ev.get("segs") or [])
+        text = clean_text(text)
+        if not text:
+            continue                                   # skips the newline-only "append" events
+        segs.append(Segment(ev.get("tStartMs", 0) / 1000, ev.get("dDurationMs", 0) / 1000, text))
+    return segs
+
+
+def fetch_transcript_ytdlp(video_id: str, language: str = "en", cookies_browser: str = "") -> tuple[list, str]:
+    """Fetch captions through yt-dlp's full YouTube extractor. Raises NoCaptions or Blocked."""
+    import yt_dlp
+    opts = {"quiet": True, "no_warnings": True, "skip_download": True, "logger": _QuietLogger(),
+            "ignore_no_formats_error": True,             # we only want captions, not video formats
+            "writesubtitles": True, "writeautomaticsub": True}
+    if cookies_browser:
+        opts["cookiesfrombrowser"] = (cookies_browser,)
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            formats, lang = _pick_track(info, language)
+            if not formats:
+                raise NoCaptions("No captions available" if language == "any" else f"No '{language}' captions available")
+            track = next((f for f in formats if f.get("ext") == "json3"), None)
+            if not track:
+                raise NoCaptions("Caption track isn't in a readable format")
+            raw = ydl.urlopen(track["url"]).read()
+    except NoCaptions:
+        raise
+    except Exception as e:
+        msg = _first_line(e).lower()
+        status = getattr(getattr(e, "response", None), "status", None) or getattr(e, "status", None)
+        if status in (403, 429) or any(h in msg for h in _BLOCK_HINTS):
+            raise Blocked(_first_line(e) or "YouTube is blocking requests from this IP") from e
+        if any(h in msg for h in _GONE_HINTS):
+            raise NoCaptions(_first_line(e)) from e
+        raise
+    segs = parse_json3(raw)
+    if not segs:
+        raise NoCaptions("Transcript is empty")
+    return segs, lang
+
+
+class SmartFetcher:
+    """Tries youtube-transcript-api first (fast, light), falls back to yt-dlp.
+
+    source: "auto" (default), "api" (transcript library only), or "ytdlp" (yt-dlp only).
+    Once the transcript library is blocked during a run, the fetcher stays on yt-dlp
+    for the rest of that run instead of hitting the blocked endpoint again.
+    `last_source` describes what happened for the most recent video (shown in failure logs).
+    """
+
+    def __init__(self, source: str = "auto", cookies_browser: str = "",
+                 api=None, ytdlp=None):
+        self.source = source if source in ("auto", "api", "ytdlp") else "auto"
+        self.cookies_browser = cookies_browser
+        self.api = api or fetch_transcript
+        self.ytdlp = ytdlp or (lambda vid, lang: fetch_transcript_ytdlp(vid, lang, self.cookies_browser))
+        self.api_blocked = False
+        self.last_source = ""
+
+    def __call__(self, video_id: str, language: str = "en"):
+        use_api = self.source == "api" or (self.source == "auto" and not self.api_blocked)
+        if use_api:
+            try:
+                result = self.api(video_id, language)
+                self.last_source = "transcript-api"
+                return result
+            except NoCaptions:
+                self.last_source = "transcript-api"
+                raise
+            except Exception as e:                       # Blocked, or anything unexpected
+                if self.source == "api":
+                    self.last_source = "transcript-api"
+                    raise
+                if isinstance(e, Blocked):
+                    self.api_blocked = True
+                note = f"transcript-api {'blocked' if isinstance(e, Blocked) else 'failed (' + type(e).__name__ + ')'} -> yt-dlp"
+                try:
+                    result = self.ytdlp(video_id, language)
+                    self.last_source = note
+                    return result
+                except Exception:
+                    self.last_source = note + " also failed"
+                    raise
+        self.last_source = "yt-dlp" + (" (transcript-api was blocked earlier this run)" if self.api_blocked else "")
+        if self.cookies_browser:
+            self.last_source += f", cookies from {self.cookies_browser}"
+        return self.ytdlp(video_id, language)
+
+
+def js_runtime() -> str:
+    """yt-dlp needs a JavaScript runtime (Deno recommended) for full YouTube support."""
+    import shutil
+    for name in ("deno", "node", "bun", "qjs"):
+        if shutil.which(name):
+            return name
+    return "none"
 
 
 # ----------------------------------------------------------------- formatting
@@ -310,12 +466,13 @@ class Runner:
     def __init__(self, collection: Collection, opts: Options,
                  on_update: Callable[[Video], None] = lambda v: None,
                  should_stop: Callable[[], bool] = lambda: False,
-                 fetcher: Callable = fetch_transcript,
+                 fetcher: Optional[Callable] = None,
                  sleeper: Callable[[float], None] = time.sleep,
                  source_url: str = ""):
         self.c, self.opts = collection, opts
         self.on_update, self.should_stop = on_update, should_stop
-        self.fetcher, self.sleep = fetcher, sleeper
+        self.fetcher = fetcher or SmartFetcher(opts.source, opts.cookies_browser)
+        self.sleep = sleeper
         self.ext = FORMATS[opts.fmt]
         base = Path(os.path.expanduser(opts.output_dir))
         self.folder = base / safe_name(collection.title) if collection.is_playlist else base
@@ -372,6 +529,7 @@ class Runner:
                 return
             try:
                 segs, lang = self.fetcher(v.video_id, self.opts.language)
+                v.source = getattr(self.fetcher, "last_source", "")
                 if self.should_stop():            # cancelled while the request was in flight
                     self._set(v, "cancelled", "Cancelled")
                     return
@@ -388,16 +546,20 @@ class Runner:
                 return
             except NoCaptions as e:
                 v.attempts, v.detail = attempt, _describe(e)
+                v.source = getattr(self.fetcher, "last_source", "")
                 self._set(v, "no_captions", str(e))
                 return
             except Blocked as e:
                 v.attempts, v.detail = attempt, _describe(e)
+                v.source = getattr(self.fetcher, "last_source", "")
                 if attempt == self.opts.retries:
-                    self._set(v, "error", f"Blocked by YouTube: {e}. Wait a while and retry.")
+                    self._set(v, "error", "YouTube is blocking requests from this IP. Wait 30-60 minutes and retry"
+                                         + ("" if self.opts.cookies_browser else ", or turn on browser cookies") + ".")
                     return
                 self.wait(15 * attempt)           # back off hard when YouTube pushes back
             except Exception as e:                # network hiccups etc.
                 v.attempts, v.detail = attempt, _describe(e)
+                v.source = getattr(self.fetcher, "last_source", "")
                 if attempt == self.opts.retries:
                     self._set(v, "error", f"{type(e).__name__}: {e}"[:300])
                     return
@@ -474,9 +636,10 @@ class Runner:
             f"Collection  : {self.c.title} ({len(self.c.videos)} video{'s' if len(self.c.videos) != 1 else ''})",
             f"Output      : {self.folder}",
             f"Options     : language={o.language}, format={o.fmt}, timestamps={o.timestamps}, "
-            f"combine={o.combine}, retries={o.retries}, delay={o.delay}s",
+            f"combine={o.combine}, retries={o.retries}, delay={o.delay}s, source={o.source}, "
+            f"browser cookies={o.cookies_browser or 'off'}",
             f"Environment : Transcript Grabber {APP_VERSION}, Python {platform.python_version()}, "
-            f"{platform.system()} {platform.release()}, {_lib_versions()}",
+            f"{platform.system()} {platform.release()}, {_lib_versions()}, JS runtime: {js_runtime()}",
             "",
             "SUMMARY",
             "-" * 48,
@@ -495,6 +658,7 @@ class Runner:
                     f"    URL      : {v.url}",
                     f"    Reason   : {v.message or '-'}",
                     f"    Attempts : {v.attempts}",
+                    f"    Method   : {v.source or '-'}",
                     f"    Detail   : {v.detail or '-'}",
                     "",
                 ]
@@ -505,6 +669,10 @@ class Runner:
         lines += ["HINTS",
                   "-" * 48,
                   "  Blocked / 429 / RequestBlocked : YouTube is throttling this IP. Wait 30-60 minutes, then retry.",
+                  "                                   Still blocked? Turn on 'Use cookies from' (Firefox works best),",
+                  "                                   and make sure no VPN is on.",
+                  "  JS runtime: none               : re-run the launcher (it installs Deno for yt-dlp), or run",
+                  "                                   pip install -U \"yt-dlp[default,deno]\"  and restart the app.",
                   "  Network or proxy errors        : check the internet connection or VPN, then retry.",
                   "  Anything else                  : update the libraries (re-run the launcher, or",
                   "                                   pip install -U yt-dlp youtube-transcript-api) and retry.",

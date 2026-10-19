@@ -22,7 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from tg_core import DEFAULT_LOG_DIR, DEFAULT_OUTPUT, FORMATS, Options, Runner, list_videos
+from tg_core import BROWSERS, SmartFetcher, DEFAULT_LOG_DIR, DEFAULT_OUTPUT, FORMATS, Options, Runner, js_runtime, list_videos
 
 STATIC = Path(__file__).resolve().parent / "static"
 
@@ -99,10 +99,20 @@ class Job:
             else:
                 self.stage = "cancelling"   # the runner stops within a moment
 
-    def retry(self, index: int):
+    def retry(self, index: int, source: str | None = None, cookies_browser: str | None = None):
         v = next((v for v in self.collection.videos if v.index == index), None) if self.collection else None
         if not v or not self.runner:
             raise ValueError("Unknown video")
+        # Use the settings as they are now, so turning on browser cookies then pressing Retry works.
+        o = self.runner.opts
+        changed = False
+        if source in ("auto", "api", "ytdlp") and source != o.source:
+            o.source, changed = source, True
+        if cookies_browser is not None and (cookies_browser in BROWSERS or cookies_browser == "") \
+                and cookies_browser != o.cookies_browser:
+            o.cookies_browser, changed = cookies_browser, True
+        if changed or not isinstance(self.runner.fetcher, SmartFetcher):
+            self.runner.fetcher = SmartFetcher(o.source, o.cookies_browser)
         with self.lock:
             self.stop_event = threading.Event()
             self.runner.should_stop = self.stop_event.is_set
@@ -191,7 +201,8 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif u.path == "/api/config":
-            self._json({"output_dir": DEFAULT_OUTPUT, "log_dir": DEFAULT_LOG_DIR, "formats": list(FORMATS)})
+            self._json({"output_dir": DEFAULT_OUTPUT, "log_dir": DEFAULT_LOG_DIR, "formats": list(FORMATS),
+                        "js_runtime": js_runtime()})
         elif u.path == "/api/status":
             self._json(JOB.status())
         elif u.path == "/api/log":
@@ -223,7 +234,9 @@ class Handler(BaseHTTPRequestHandler):
                                fmt=fmt if fmt in FORMATS else "txt",
                                output_dir=(data.get("output_dir") or DEFAULT_OUTPUT).strip(),
                                overwrite=bool(data.get("overwrite", False)),
-                               log_dir=(data.get("log_dir") or DEFAULT_LOG_DIR).strip())
+                               log_dir=(data.get("log_dir") or DEFAULT_LOG_DIR).strip(),
+                               source=data.get("source") if data.get("source") in ("auto", "api", "ytdlp") else "auto",
+                               cookies_browser=data.get("cookies_browser") if data.get("cookies_browser") in BROWSERS else "")
                 JOB.start(url, opts)
                 return self._json({"ok": True})
             if path in ("/api/cancel", "/api/stop"):
@@ -232,7 +245,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/retry":
                 if JOB.busy():
                     return self._json({"error": "Wait for the current run to finish."}, 409)
-                JOB.retry(int(data["index"]))
+                JOB.retry(int(data["index"]), data.get("source"), data.get("cookies_browser"))
                 return self._json({"ok": True})
             if path == "/api/open":
                 return self._open(data)
@@ -280,6 +293,8 @@ def main():
     srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
     url = f"http://127.0.0.1:{a.port}"
     print(f"Transcript Grabber is running at {url}\nClose this window (or press Ctrl+C) to quit.")
+    if js_runtime() == "none":
+        print("Note: no JavaScript runtime found. yt-dlp works best with Deno; re-run the launcher to install it.")
     if not a.no_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:

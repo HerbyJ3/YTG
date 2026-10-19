@@ -62,7 +62,35 @@ Keeping the core free of UI code is what lets the CLI and the web app behave ide
    - Every status change calls an `on_update` callback. The CLI prints a line; the web app just keeps the state for the next poll.
 4. **Report.** The UI polls `GET /api/status` every 800 ms and re-renders the list, the progress bar, and the preview.
 
-### Fetching and error handling
+### Fetching: two paths and a fallback
+
+Captions can come from two places, and they make different trade-offs:
+
+| Path | How it works | Strength | Weakness |
+|---|---|---|---|
+| **youtube-transcript-api** | A few lightweight requests to YouTube's caption endpoints | Fast and light | Easy for YouTube to fingerprint; IP blocks are common, even on home connections |
+| **yt-dlp** | YouTube's full extraction flow (the same one a player uses), with a JavaScript runtime (Deno) to solve YouTube's player challenges, plus optional browser cookies | Much harder to block | Heavier: one full extraction per video |
+
+`SmartFetcher` combines them with a simple policy:
+
+1. **Try the light path first.** If it succeeds, done. If it says *no captions*, trust it: that's a fact about the video, and the other path would only confirm it.
+2. **On a block or an unexpected error, fall back to yt-dlp** for that same video right away, without spending the retry budget.
+3. **Stay switched.** After one block, skip the light path for the rest of the run. An IP that's blocked on video 1 will be blocked on video 2, and hammering a blocked endpoint can make a block last longer.
+4. **Record the path.** The path used for each video goes into the failure log (`Method: transcript-api blocked -> yt-dlp`), so a log shows what was tried, not just that it failed.
+
+This came straight from a real failure log. On a home Windows PC, the transcript library came back `IpBlocked`, but in the same run yt-dlp had just fetched the video's title from the same IP. That pointed at the light path's request pattern, not the IP, as the thing being blocked.
+
+The yt-dlp path (`fetch_transcript_ytdlp`):
+- **Extraction:** runs yt-dlp with `skip_download` and `ignore_no_formats_error`. We want caption metadata, not video formats, so a format-extraction problem shouldn't sink the request.
+- **Track choice (`_pick_track`):** manual subtitles in the requested language first. Then YouTube's auto-generated track in the video's original language (`en-orig`), then an auto-translated track. Live-chat replays are never chosen.
+- **Download and parse:** downloads the track in YouTube's **json3** format through yt-dlp's own HTTP stack, so it carries the same cookies and headers. `parse_json3()` turns it into segments and drops the newline-only "append" events auto-captions contain. This avoids the rolling duplicate lines you get from auto-generated VTT files.
+- **Error mapping:** yt-dlp's messages are mapped onto the same domain errors as the other path. A bot check or HTTP 403/429 becomes `Blocked`; a private, removed, or members-only video becomes `NoCaptions`.
+
+Two environment details make the yt-dlp path dependable:
+- **The JavaScript runtime ships with the app.** `requirements.txt` installs `yt-dlp[default,deno]`, which brings yt-dlp's challenge-solver scripts (`yt-dlp-ejs`) and the Deno runtime as ordinary pip packages, so nothing needs installing by hand.
+- **Deno is put on PATH.** Pip puts Deno next to the virtual environment's Python, and Windows doesn't add that folder to `PATH` unless the venv is "activated," so `tg_core` adds it at import. The detected runtime is shown in the UI and recorded in every failure log.
+
+### Error handling
 
 `fetch_transcript()` asks youtube-transcript-api for the list of available caption tracks and picks one:
 - **Track choice:** the requested language first; failing that, a machine translation of any translatable track; with **Any available**, the first track.
@@ -72,7 +100,7 @@ It then converts the library's many exception types into **three outcomes the re
 | Outcome | Examples | What the Runner does |
 |---|---|---|
 | `NoCaptions` | captions disabled, no transcript, video unavailable | Marks the video **No captions** and moves on with no retry, since retrying can't help |
-| `Blocked` | YouTube is rate-limiting or blocking the IP | Retries with a long backoff (15 s, 30 s); if it still fails, marks the video failed and suggests waiting |
+| `Blocked` | YouTube is rate-limiting or blocking the IP | Falls back to yt-dlp first (see above). If both paths are blocked, retries with a long backoff (15 s, 30 s), then marks the video failed and suggests browser cookies or waiting |
 | Anything else | network blips | Retries with a short backoff (3 s, 6 s) |
 
 Translating library-specific errors into a small set of domain errors is a deliberate boundary. When the library changes its exception names (it has before), only one function needs updating.
@@ -166,17 +194,20 @@ The UI also escapes every value it puts into the page (video titles come from th
 
 The core takes its side effects as parameters: `Runner(fetcher=..., sleeper=..., should_stop=...)`. That's **dependency injection**, and it's what makes the logic testable without YouTube or real time:
 
-- **Unit tests (`test_core.py`, 15 tests, run offline in milliseconds):**
+- **Unit tests (`test_core.py`, 21 tests, run offline in milliseconds):**
   - Parsing video IDs from every URL shape, and sanitizing file names.
   - Output in all three formats, combined files, and paragraph building.
   - Resume (skips files that already exist).
   - Retries and backoff when blocked.
   - Cancellation: mid-run, during a long wait, and with an in-flight result discarded.
   - Failure logs: contents and the full error chain, no log for a clean run, and a log that updates on retry and disappears once fixed.
+  - The fallback: json3 parsing, caption-track selection, falling back when blocked, staying on yt-dlp afterward, and trusting "no captions."
+  - The yt-dlp fetcher itself, run against a fake yt-dlp: track download, and the mapping of bot checks, private videos, and missing tracks.
 - **End-to-end tests:** a headless Chromium (Playwright) drove the real UI against the real server, with only YouTube swapped for a fake:
   - starting a run, previewing, and retrying,
   - cancelling mid-run, cancelling during playlist listing, and starting a new run right after,
   - a run with a network failure and a no-caption video, producing the failure log, the red failure bar, and View/Open log,
+  - a reproduction of a real block: the transcript library blocked for every video, yt-dlp recovering most of them, and one stuck video fixed by turning on browser cookies and pressing Retry,
   - the origin check and the path allowlist,
   - phone-width layout (no horizontal scrolling).
 
@@ -191,7 +222,7 @@ python -m unittest test_core
 1. **Design first.** The UI was designed as a high-fidelity mockup with Higgsfield's image generation (GPT Image), covering the dark theme, amber accent, status chips, and preview pane. The HTML and CSS were then built to match it.
 2. **Core next.** The logic was written behind the injection points above, so it could be tested before any UI existed.
 3. **Interfaces last.** The CLI and the web server are thin wrappers over the core.
-4. **Then iterated:** for example, adding the Cancel button and the generation-counter logic that makes it safe, then failure logs.
+4. **Then iterated:** for example, adding the Cancel button and the generation-counter logic that makes it safe, then failure logs, then the yt-dlp fallback after a real block showed up in one of those logs.
 
 The code was written with Claude (Anthropic's AI model) as a pair programmer. Herby set the requirements and the design direction, and reviewed the result; Claude drafted the code, tests, and documentation. Every decision in this document holds on its own engineering merits and can be checked in the code.
 
@@ -199,5 +230,6 @@ The code was written with Claude (Anthropic's AI model) as a pair programmer. He
 
 - **Captions required:** it can't produce transcripts for videos without captions. A future option could download the audio and transcribe it locally with Whisper.
 - **One job at a time:** a queue of URLs exists only in the CLI (`--urls-file`). A UI queue would be a natural addition.
-- **No proxy support yet:** youtube-transcript-api supports proxies, which would help heavy users who get blocked often.
+- **No proxy support yet:** both libraries support proxies, which would help heavy users who get blocked even with cookies.
+- **Not verified live in development:** the development sandbox can't reach YouTube, so the yt-dlp path was tested against a faithful fake of yt-dlp's API. Its first live run was on a real PC.
 - **Packaging:** a PyInstaller build could ship it as a single `.exe` with no Python install required.
