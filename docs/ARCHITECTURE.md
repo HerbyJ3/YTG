@@ -86,6 +86,28 @@ The yt-dlp path (`fetch_transcript_ytdlp`):
 - **Download and parse:** downloads the track in YouTube's **json3** format through yt-dlp's own HTTP stack, so it carries the same cookies and headers. `parse_json3()` turns it into segments and drops the newline-only "append" events auto-captions contain. This avoids the rolling duplicate lines you get from auto-generated VTT files.
 - **Error mapping:** yt-dlp's messages are mapped onto the same domain errors as the other path. A bot check or HTTP 403/429 becomes `Blocked`; a private, removed, or members-only video becomes `NoCaptions`.
 
+### Rate limits (HTTP 429) need a different strategy from blocks
+
+The second real failure log showed the yt-dlp path itself failing with **HTTP 429 on the caption download**, after three attempts 15 and 30 seconds apart. Two findings shaped the fix:
+
+1. **It wasn't a translated-track problem.** YouTube rate-limits *auto-translated* captions especially hard. But reading yt-dlp's caption-extraction code showed that for an English video both `en` and `en-orig` point at the original track, with no translation parameter. So this was plain per-IP rate limiting. The log now records the exact track (for example, `track en (auto-generated, original language)`) and which step failed (`video page` or `caption download`), so the next log can't leave this ambiguous.
+2. **The app's own retries were making it worse.** yt-dlp's maintainers report that waits under about 60 seconds keep failing, and each early attempt restarts YouTube's cooldown.
+
+So errors are now split into types, each with its own policy:
+
+| Error | Policy |
+|---|---|
+| `RateLimited` (429) | **One** retry after 75 s, shown in the UI as **Waiting 75s**. A 120 s cooldown before the *next* video's first request. If two videos in a row end rate-limited, the run **stops itself** and marks the rest "not tried", because continuing only extends the limit. A success resets the streak. |
+| `BotCheck` (*sign in to confirm you're not a bot*) | No retry. It can only be fixed with cookies, and the message says so. |
+| `CookieProblem` (locked or undecryptable browser cookies, missing cookies.txt) | No retry, and the message names the browser and the fix. |
+| `Blocked` (other refusals) | The original backoff (15 s, 30 s). |
+
+Errors from yt-dlp are classified by `_raise_mapped()` from the HTTP status and the message text. The cases were taken from yt-dlp's own source: its cookie-loading errors, its HTTPError type, and its bot-check message.
+
+**Cookies** are the real fix for rate limits, because signed-in requests get far higher limits. They can come from a browser (`cookiesfrombrowser`) or a Netscape-format **cookies.txt** file (`cookiefile`). The file option exists because yt-dlp can't decrypt Chrome or Edge cookies on Windows, and that failure is only a *warning* in yt-dlp: the request silently goes out without cookies. A cookies.txt export sidesteps that. When cookies are configured, `SmartFetcher` skips the lightweight library entirely, since it can't use them and every request it makes counts against the same limit.
+
+**Retry keeps what the run learned.** Pressing Retry rebuilds the fetcher only if the cookie or method settings changed, and it carries over the "transcript library is blocked" flag, so a retry doesn't spend a request on an endpoint that already refused.
+
 Two environment details make the yt-dlp path dependable:
 - **The JavaScript runtime ships with the app.** `requirements.txt` installs `yt-dlp[default,deno]`, which brings yt-dlp's challenge-solver scripts (`yt-dlp-ejs`) and the Deno runtime as ordinary pip packages, so nothing needs installing by hand.
 - **Deno is put on PATH.** Pip puts Deno next to the virtual environment's Python, and Windows doesn't add that folder to `PATH` unless the venv is "activated," so `tg_core` adds it at import. The detected runtime is shown in the UI and recorded in every failure log.
@@ -194,7 +216,7 @@ The UI also escapes every value it puts into the page (video titles come from th
 
 The core takes its side effects as parameters: `Runner(fetcher=..., sleeper=..., should_stop=...)`. That's **dependency injection**, and it's what makes the logic testable without YouTube or real time:
 
-- **Unit tests (`test_core.py`, 21 tests, run offline in milliseconds):**
+- **Unit tests (`test_core.py`, 27 tests, run offline in milliseconds):**
   - Parsing video IDs from every URL shape, and sanitizing file names.
   - Output in all three formats, combined files, and paragraph building.
   - Resume (skips files that already exist).
@@ -203,11 +225,14 @@ The core takes its side effects as parameters: `Runner(fetcher=..., sleeper=...,
   - Failure logs: contents and the full error chain, no log for a clean run, and a log that updates on retry and disappears once fixed.
   - The fallback: json3 parsing, caption-track selection, falling back when blocked, staying on yt-dlp afterward, and trusting "no captions."
   - The yt-dlp fetcher itself, run against a fake yt-dlp: track download, and the mapping of bot checks, private videos, and missing tracks.
+  - Rate limits: one patient retry (at least 75 s), the cooldown before the next video, the self-stop after two rate-limited videos, and the streak resetting after a success. Bot checks and cookie problems fail without retrying, and cookies route straight to yt-dlp.
+  - Error mapping for real yt-dlp error texts and a real `HTTPError` 429.
 - **End-to-end tests:** a headless Chromium (Playwright) drove the real UI against the real server, with only YouTube swapped for a fake:
   - starting a run, previewing, and retrying,
   - cancelling mid-run, cancelling during playlist listing, and starting a new run right after,
   - a run with a network failure and a no-caption video, producing the failure log, the red failure bar, and View/Open log,
   - a reproduction of a real block: the transcript library blocked for every video, yt-dlp recovering most of them, and one stuck video fixed by turning on browser cookies and pressing Retry,
+  - a reproduction of the second real log (429 on every caption download): the **Waiting** countdown, the self-stop after two videos, and the failure bar explaining why,
   - the origin check and the path allowlist,
   - phone-width layout (no horizontal scrolling).
 
@@ -222,7 +247,7 @@ python -m unittest test_core
 1. **Design first.** The UI was designed as a high-fidelity mockup with Higgsfield's image generation (GPT Image), covering the dark theme, amber accent, status chips, and preview pane. The HTML and CSS were then built to match it.
 2. **Core next.** The logic was written behind the injection points above, so it could be tested before any UI existed.
 3. **Interfaces last.** The CLI and the web server are thin wrappers over the core.
-4. **Then iterated:** for example, adding the Cancel button and the generation-counter logic that makes it safe, then failure logs, then the yt-dlp fallback after a real block showed up in one of those logs.
+4. **Then iterated:** for example, adding the Cancel button and the generation-counter logic that makes it safe, then failure logs, then the yt-dlp fallback after a real block showed up in one of those logs, then rate-limit handling after the next log showed a 429.
 
 The code was written with Claude (Anthropic's AI model) as a pair programmer. Herby set the requirements and the design direction, and reviewed the result; Claude drafted the code, tests, and documentation. Every decision in this document holds on its own engineering merits and can be checked in the code.
 

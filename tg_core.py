@@ -28,7 +28,7 @@ if _ENV_BIN not in os.environ.get("PATH", "").split(os.pathsep):
 
 DEFAULT_OUTPUT = str(Path.home() / "Transcript Grabber")
 DEFAULT_LOG_DIR = str(Path.home() / "Transcript Grabber" / "Failure Logs")
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 BROWSERS = ("firefox", "chrome", "edge", "brave", "chromium", "opera", "vivaldi", "safari")
 FORMATS = {"txt": ".txt", "md": ".md", "json": ".json"}
 
@@ -76,6 +76,7 @@ class Options:
     log_dir: str = DEFAULT_LOG_DIR  # where failure logs go
     source: str = "auto"            # auto | api | ytdlp  (how captions are fetched)
     cookies_browser: str = ""       # "", firefox, chrome, edge, brave... (yt-dlp only)
+    cookies_file: str = ""          # path to a Netscape-format cookies.txt (yt-dlp only)
 
 
 @dataclass
@@ -206,6 +207,18 @@ class Blocked(Exception):
     pass
 
 
+class RateLimited(Blocked):
+    """HTTP 429. YouTube's per-IP rate limit: only a long pause (60s+) helps; quick retries reset the clock."""
+
+
+class BotCheck(Blocked):
+    """'Sign in to confirm you're not a bot'. Retrying without cookies is pointless."""
+
+
+class CookieProblem(Exception):
+    """Browser cookies were requested but couldn't be read."""
+
+
 def fetch_transcript(video_id: str, language: str = "en") -> tuple[list[Segment], str]:
     """Return (segments, language_code). Raises NoCaptions or Blocked."""
     from youtube_transcript_api import YouTubeTranscriptApi
@@ -296,61 +309,118 @@ def parse_json3(raw) -> list:
     return segs
 
 
-def fetch_transcript_ytdlp(video_id: str, language: str = "en", cookies_browser: str = "") -> tuple[list, str]:
-    """Fetch captions through yt-dlp's full YouTube extractor. Raises NoCaptions or Blocked."""
+def fetch_transcript_ytdlp(video_id: str, language: str = "en", cookies_browser: str = "",
+                           cookies_file: str = "", info_out: Optional[dict] = None) -> tuple[list, str]:
+    """Fetch captions through yt-dlp's full YouTube extractor.
+
+    Raises NoCaptions, RateLimited, BotCheck, Blocked, or CookieProblem. Details about the
+    chosen track are written into `info_out` (for the failure log).
+    """
     import yt_dlp
+    info_out = info_out if info_out is not None else {}
     opts = {"quiet": True, "no_warnings": True, "skip_download": True, "logger": _QuietLogger(),
             "ignore_no_formats_error": True,             # we only want captions, not video formats
             "writesubtitles": True, "writeautomaticsub": True}
-    if cookies_browser:
+    if cookies_file:
+        if not os.path.isfile(os.path.expanduser(cookies_file)):
+            raise CookieProblem(f"Cookies file not found: {cookies_file}")
+        opts["cookiefile"] = os.path.expanduser(cookies_file)
+    elif cookies_browser:
         opts["cookiesfrombrowser"] = (cookies_browser,)
     url = f"https://www.youtube.com/watch?v={video_id}"
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        # Step 1: the video page / player (where bot checks happen)
+        info_out["step"] = "video page"
+        try:
             info = ydl.extract_info(url, download=False)
-            formats, lang = _pick_track(info, language)
-            if not formats:
-                raise NoCaptions("No captions available" if language == "any" else f"No '{language}' captions available")
-            track = next((f for f in formats if f.get("ext") == "json3"), None)
-            if not track:
-                raise NoCaptions("Caption track isn't in a readable format")
+        except Exception as e:
+            _raise_mapped(e, "video page", cookies_browser)
+            raise
+        formats, lang = _pick_track(info, language)
+        if not formats:
+            raise NoCaptions("No captions available" if language == "any" else f"No '{language}' captions available")
+        track = next((f for f in formats if f.get("ext") == "json3"), None)
+        if not track:
+            raise NoCaptions("Caption track isn't in a readable format")
+        manual = lang in (info.get("subtitles") or {})
+        translated = "tlang=" in track.get("url", "")
+        original = not manual and (info.get("automatic_captions") or {}).get(f"{lang}-orig") is formats
+        info_out["track"] = (f"{lang} ({'manual' if manual else 'auto-generated'}"
+                             f"{', original language' if original else ''}{', auto-translated' if translated else ''})")
+        # Step 2: the caption file itself (where 429 rate limits happen)
+        info_out["step"] = "caption download"
+        try:
             raw = ydl.urlopen(track["url"]).read()
-    except NoCaptions:
-        raise
-    except Exception as e:
-        msg = _first_line(e).lower()
-        status = getattr(getattr(e, "response", None), "status", None) or getattr(e, "status", None)
-        if status in (403, 429) or any(h in msg for h in _BLOCK_HINTS):
-            raise Blocked(_first_line(e) or "YouTube is blocking requests from this IP") from e
-        if any(h in msg for h in _GONE_HINTS):
-            raise NoCaptions(_first_line(e)) from e
-        raise
+        except Exception as e:
+            _raise_mapped(e, "caption download", cookies_browser, translated)
+            raise
     segs = parse_json3(raw)
     if not segs:
         raise NoCaptions("Transcript is empty")
     return segs, lang
 
 
+def _raise_mapped(e: BaseException, step: str, cookies_browser: str = "", translated: bool = False):
+    """Translate yt-dlp's errors into the app's error types."""
+    msg = _first_line(e)
+    low = msg.lower()
+    status = getattr(getattr(e, "response", None), "status", None) or getattr(e, "status", None)
+    if type(e).__name__ == "CookieLoadError" or "cookie database" in low or "dpapi" in low \
+            or "cookies database" in low:
+        name = (cookies_browser or "the browser").capitalize()
+        raise CookieProblem(f"Couldn't read {name}'s cookies: {msg}. Close {name} completely and retry, "
+                            "or use Firefox or a cookies.txt file instead.") from e
+    if status == 429 or "429" in low or "too many requests" in low:
+        extra = " (auto-translated tracks are limited much more strictly)" if translated else ""
+        raise RateLimited(f"YouTube rate-limited the {step} (HTTP 429){extra}") from e
+    if "sign in to confirm" in low or "not a bot" in low:
+        raise BotCheck("YouTube asked to confirm this isn't a bot") from e
+    if status == 403 or any(h in low for h in _BLOCK_HINTS):
+        raise Blocked(f"YouTube refused the {step}: {msg}") from e
+    if any(h in low for h in _GONE_HINTS):
+        raise NoCaptions(msg) from e
+
+
 class SmartFetcher:
     """Tries youtube-transcript-api first (fast, light), falls back to yt-dlp.
 
     source: "auto" (default), "api" (transcript library only), or "ytdlp" (yt-dlp only).
-    Once the transcript library is blocked during a run, the fetcher stays on yt-dlp
-    for the rest of that run instead of hitting the blocked endpoint again.
+    - Once the transcript library is blocked in a run, stay on yt-dlp for the rest of it.
+    - When cookies are configured, go straight to yt-dlp: only it can use them, and
+      skipping the blocked endpoint saves a request against the rate limit.
     `last_source` describes what happened for the most recent video (shown in failure logs).
     """
 
-    def __init__(self, source: str = "auto", cookies_browser: str = "",
+    def __init__(self, source: str = "auto", cookies_browser: str = "", cookies_file: str = "",
                  api=None, ytdlp=None):
         self.source = source if source in ("auto", "api", "ytdlp") else "auto"
-        self.cookies_browser = cookies_browser
+        self.cookies_browser, self.cookies_file = cookies_browser, cookies_file
         self.api = api or fetch_transcript
-        self.ytdlp = ytdlp or (lambda vid, lang: fetch_transcript_ytdlp(vid, lang, self.cookies_browser))
+        self._ytdlp = ytdlp
         self.api_blocked = False
         self.last_source = ""
 
+    def _run_ytdlp(self, video_id, language):
+        info = {}
+        try:
+            if self._ytdlp:
+                return self._ytdlp(video_id, language)
+            return fetch_transcript_ytdlp(video_id, language, self.cookies_browser, self.cookies_file, info)
+        finally:
+            bits = [f"track {info['track']}" if info.get("track") else "",
+                    f"failed at: {info['step']}" if info.get("step") and "track" not in info else ""]
+            self._detail = ", ".join(b for b in bits if b)
+
+    def _cookies_label(self):
+        if self.cookies_file:
+            return "cookies.txt"
+        return f"{self.cookies_browser} cookies" if self.cookies_browser else ""
+
     def __call__(self, video_id: str, language: str = "en"):
-        use_api = self.source == "api" or (self.source == "auto" and not self.api_blocked)
+        self._detail = ""
+        signed_in = bool(self.cookies_file or self.cookies_browser)
+        use_api = self.source == "api" or (self.source == "auto" and not self.api_blocked and not signed_in)
         if use_api:
             try:
                 result = self.api(video_id, language)
@@ -367,16 +437,21 @@ class SmartFetcher:
                     self.api_blocked = True
                 note = f"transcript-api {'blocked' if isinstance(e, Blocked) else 'failed (' + type(e).__name__ + ')'} -> yt-dlp"
                 try:
-                    result = self.ytdlp(video_id, language)
-                    self.last_source = note
+                    result = self._run_ytdlp(video_id, language)
+                    self.last_source = self._label(note)
                     return result
                 except Exception:
-                    self.last_source = note + " also failed"
+                    self.last_source = self._label(note + " also failed")
                     raise
-        self.last_source = "yt-dlp" + (" (transcript-api was blocked earlier this run)" if self.api_blocked else "")
-        if self.cookies_browser:
-            self.last_source += f", cookies from {self.cookies_browser}"
-        return self.ytdlp(video_id, language)
+        why = " (transcript-api was blocked earlier this run)" if self.api_blocked else ""
+        try:
+            return self._run_ytdlp(video_id, language)
+        finally:
+            self.last_source = self._label("yt-dlp" + why)
+
+    def _label(self, base):
+        extra = [x for x in (self._cookies_label(), getattr(self, "_detail", "")) if x]
+        return base + (f" [{'; '.join(extra)}]" if extra else "")
 
 
 def js_runtime() -> str:
@@ -471,7 +546,11 @@ class Runner:
                  source_url: str = ""):
         self.c, self.opts = collection, opts
         self.on_update, self.should_stop = on_update, should_stop
-        self.fetcher = fetcher or SmartFetcher(opts.source, opts.cookies_browser)
+        self.fetcher = fetcher or SmartFetcher(opts.source, opts.cookies_browser, opts.cookies_file)
+        self.cooldown_until = 0.0     # after a 429, no caption request until this time (monotonic)
+        self.rate_limited_streak = 0  # consecutive videos that ended rate-limited
+        self.stopped_for_rate_limit = False
+        self.pending_cooldown = 0.0   # seconds to wait before the next caption request
         self.sleep = sleeper
         self.ext = FORMATS[opts.fmt]
         base = Path(os.path.expanduser(opts.output_dir))
@@ -502,10 +581,16 @@ class Runner:
                     break
             first = False
             self.process(v, target)
-        if self.should_stop():
+            if self.rate_limited_streak >= self.RATE_LIMIT_STOP_AFTER:
+                # Every further request restarts YouTube's cooldown, so stop instead of making it worse.
+                self.stopped_for_rate_limit = True
+                break
+        if self.should_stop() or self.stopped_for_rate_limit:
+            msg = ("Not tried: stopped because YouTube is rate-limiting this IP"
+                   if self.stopped_for_rate_limit and not self.should_stop() else "Cancelled")
             for v in self.c.videos:
-                if v.status in ("queued", "fetching"):
-                    self._set(v, "cancelled", "Cancelled")
+                if v.status in ("queued", "fetching", "waiting"):
+                    self._set(v, "cancelled", msg)
         # On cancel, the combined file still gets whatever was fetched.
         combined_file = self._write_combined() if self.opts.combine else ""
         self.write_failure_log()
@@ -517,13 +602,41 @@ class Runner:
         while remaining > 0 and not self.should_stop():
             chunk = min(step, remaining)
             self.sleep(chunk)
-            remaining -= chunk
+            remaining = round(remaining - chunk, 6)   # avoid float drift over many small steps
+
+    # How the runner reacts to YouTube's HTTP 429 rate limit. yt-dlp's maintainers report that
+    # waits under ~60s keep failing, and every early retry restarts YouTube's cooldown.
+    RATE_LIMIT_WAIT = 75            # seconds before the one retry of a rate-limited video
+    RATE_LIMIT_NEXT_VIDEO = 120     # seconds before the next video's first request after a 429
+    RATE_LIMIT_STOP_AFTER = 2       # consecutive rate-limited videos before the run stops itself
+
+    def _signed_in(self) -> bool:
+        return bool(self.opts.cookies_file or self.opts.cookies_browser)
+
+    def _cookie_hint(self) -> str:
+        return "" if self._signed_in() else " Turning on cookies (Firefox, or a cookies.txt file) raises the limit a lot."
+
+    def _pause(self, v: Video, seconds: float, why: str) -> bool:
+        """Wait before the next request, showing it in the UI. Returns False if cancelled."""
+        self._set(v, "waiting", f"{why}: waiting {int(seconds)}s before trying again")
+        self.wait(seconds)
+        if self.should_stop():
+            self._set(v, "cancelled", "Cancelled")
+            return False
+        self._set(v, "fetching")
+        return True
 
     def process(self, v: Video, target: Optional[Path] = None) -> None:
         target = target or self.file_for(v)
-        v.detail, v.attempts = "", 0
+        v.detail, v.attempts, v.source = "", 0, ""
         self._set(v, "fetching")
-        for attempt in range(1, self.opts.retries + 1):
+        if self.pending_cooldown:                         # an earlier video just hit the rate limit
+            wait, self.pending_cooldown = self.pending_cooldown, 0
+            if not self._pause(v, wait, "YouTube rate limit"):
+                return
+        attempt = 0
+        while attempt < self.opts.retries:
+            attempt += 1
             if self.should_stop():
                 self._set(v, "cancelled", "Cancelled")
                 return
@@ -537,6 +650,7 @@ class Runner:
                 segs = [s for s in segs if s.text]
                 v.language = lang
                 self.rendered[v.video_id] = render(v, segs, self.opts)
+                self.rate_limited_streak = 0
                 if self.opts.combine:
                     self.combined.append((v, segs))
                     self._set(v, "saved", f"{len(segs)} lines")
@@ -545,27 +659,55 @@ class Runner:
                     self._set(v, "saved", f"{len(segs)} lines", str(target))
                 return
             except NoCaptions as e:
-                v.attempts, v.detail = attempt, _describe(e)
-                v.source = getattr(self.fetcher, "last_source", "")
+                self._record(v, attempt, e)
+                self.rate_limited_streak = 0
                 self._set(v, "no_captions", str(e))
                 return
+            except CookieProblem as e:                     # retrying can't fix this
+                self._record(v, attempt, e)
+                self._set(v, "error", str(e))
+                return
+            except BotCheck as e:                          # nor this, without (working) cookies
+                self._record(v, attempt, e)
+                self._set(v, "error", (
+                    "YouTube wants to confirm this isn't a bot, even with cookies on. The cookies may be "
+                    "expired or not signed in to YouTube: sign in to YouTube in that browser, then retry."
+                    if self._signed_in() else
+                    "YouTube wants to confirm this isn't a bot. Turn on cookies (Firefox, or a cookies.txt "
+                    "file) under \u201cIf YouTube blocks you\u201d, then retry."))
+                return
+            except RateLimited as e:
+                self._record(v, attempt, e)
+                if attempt < 2 and attempt < self.opts.retries:      # one patient retry, never a quick one
+                    if not self._pause(v, self.RATE_LIMIT_WAIT, "YouTube rate limit (HTTP 429)"):
+                        return
+                    continue
+                self.rate_limited_streak += 1
+                self.pending_cooldown = self.RATE_LIMIT_NEXT_VIDEO
+                self._set(v, "error",
+                          "YouTube is rate-limiting caption downloads from this IP (HTTP 429). Leave it for at "
+                          "least an hour (each try restarts the clock), then retry." + self._cookie_hint())
+                return
             except Blocked as e:
-                v.attempts, v.detail = attempt, _describe(e)
-                v.source = getattr(self.fetcher, "last_source", "")
+                self._record(v, attempt, e)
                 if attempt == self.opts.retries:
-                    self._set(v, "error", "YouTube is blocking requests from this IP. Wait 30-60 minutes and retry"
-                                         + ("" if self.opts.cookies_browser else ", or turn on browser cookies") + ".")
+                    self._set(v, "error", "YouTube is blocking requests from this IP. Wait 30-60 minutes and retry."
+                              + self._cookie_hint())
                     return
-                self.wait(15 * attempt)           # back off hard when YouTube pushes back
+                if not self._pause(v, 15 * attempt, "Blocked by YouTube"):
+                    return
             except Exception as e:                # network hiccups etc.
-                v.attempts, v.detail = attempt, _describe(e)
-                v.source = getattr(self.fetcher, "last_source", "")
+                self._record(v, attempt, e)
                 if attempt == self.opts.retries:
                     self._set(v, "error", f"{type(e).__name__}: {e}"[:300])
                     return
                 self.wait(3 * attempt)
-        if self.should_stop() and v.status == "fetching":
+        if self.should_stop() and v.status in ("fetching", "waiting"):
             self._set(v, "cancelled", "Cancelled")
+
+    def _record(self, v: Video, attempt: int, e: BaseException) -> None:
+        v.attempts, v.detail = attempt, _describe(e)
+        v.source = getattr(self.fetcher, "last_source", "")
 
     def _write_combined(self) -> str:
         if not self.combined:
@@ -597,7 +739,7 @@ class Runner:
         for v in self.c.videos:
             counts[v.status] = counts.get(v.status, 0) + 1
         return {"folder": str(self.folder), "combined_file": combined_file, "counts": counts,
-                "log_file": self.log_file}
+                "log_file": self.log_file, "rate_limit_stop": self.stopped_for_rate_limit}
 
     # ------------------------------------------------------------- failure log
 
@@ -637,7 +779,7 @@ class Runner:
             f"Output      : {self.folder}",
             f"Options     : language={o.language}, format={o.fmt}, timestamps={o.timestamps}, "
             f"combine={o.combine}, retries={o.retries}, delay={o.delay}s, source={o.source}, "
-            f"browser cookies={o.cookies_browser or 'off'}",
+            f"cookies={'cookies.txt' if o.cookies_file else (o.cookies_browser or 'off')}",
             f"Environment : Transcript Grabber {APP_VERSION}, Python {platform.python_version()}, "
             f"{platform.system()} {platform.release()}, {_lib_versions()}, JS runtime: {js_runtime()}",
             "",
@@ -662,15 +804,25 @@ class Runner:
                     f"    Detail   : {v.detail or '-'}",
                     "",
                 ]
+        if self.stopped_for_rate_limit:
+            not_tried = [v for v in self.c.videos if v.status == "cancelled"]
+            lines += [f"STOPPED EARLY: {self.RATE_LIMIT_STOP_AFTER} videos in a row were rate-limited, so the run "
+                      f"stopped instead of extending YouTube's cooldown. {len(not_tried)} video(s) were not tried; "
+                      "run the same link again later and saved videos will be skipped.", ""]
         retry = [v.url for v in failed if v.status == "error"]
         if retry:
             lines += ["RETRY LIST (save as links.txt and run: python transcript_grabber.py --urls-file links.txt)",
                       "-" * 48, *retry, ""]
         lines += ["HINTS",
                   "-" * 48,
-                  "  Blocked / 429 / RequestBlocked : YouTube is throttling this IP. Wait 30-60 minutes, then retry.",
-                  "                                   Still blocked? Turn on 'Use cookies from' (Firefox works best),",
-                  "                                   and make sure no VPN is on.",
+                  "  HTTP 429 (rate limited)        : YouTube limits caption downloads per IP. Every attempt restarts",
+                  "                                   the cooldown, so stop for at least an hour, then retry ONCE.",
+                  "                                   Cookies raise the limit a lot: pick Firefox, or a cookies.txt",
+                  "                                   file, under 'If YouTube blocks you'. Turn off any VPN.",
+                  "  Not a bot / Sign in            : needs cookies from a browser signed in to YouTube.",
+                  "  Couldn't read cookies          : close that browser completely, or use Firefox / cookies.txt.",
+                  "                                   (Chrome and Edge on Windows often can't be read; use cookies.txt.)",
+                  "  Blocked / RequestBlocked       : YouTube is throttling this IP. Wait 30-60 minutes, then retry.",
                   "  JS runtime: none               : re-run the launcher (it installs Deno for yt-dlp), or run",
                   "                                   pip install -U \"yt-dlp[default,deno]\"  and restart the app.",
                   "  Network or proxy errors        : check the internet connection or VPN, then retry.",

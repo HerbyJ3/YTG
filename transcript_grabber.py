@@ -15,7 +15,8 @@ import sys
 
 from tg_core import BROWSERS, DEFAULT_LOG_DIR, DEFAULT_OUTPUT, Options, Runner, list_videos
 
-ICONS = {"saved": "OK  ", "skipped": "SKIP", "no_captions": "NONE", "error": "FAIL", "fetching": "... "}
+ICONS = {"saved": "OK  ", "skipped": "SKIP", "no_captions": "NONE", "error": "FAIL", "fetching": "... ",
+         "waiting": "WAIT", "cancelled": "STOP"}
 
 
 def main(argv=None) -> int:
@@ -28,6 +29,7 @@ def main(argv=None) -> int:
                    help="How to fetch captions: auto (transcript library, falling back to yt-dlp), api, or ytdlp")
     p.add_argument("--cookies-from-browser", choices=BROWSERS, metavar="BROWSER",
                    help="Use your browser's YouTube cookies when YouTube blocks requests (firefox works best)")
+    p.add_argument("--cookies", metavar="FILE", help="Use a cookies.txt file (Netscape format) exported from your browser")
     p.add_argument("--format", choices=["txt", "md", "json"], default="txt")
     p.add_argument("--lang", default="en", help='Language code, e.g. en, es, fr, or "any" (default: en)')
     p.add_argument("--no-timestamps", action="store_true", help="Write flowing paragraphs instead of timestamped lines")
@@ -46,7 +48,8 @@ def main(argv=None) -> int:
 
     opts = Options(language=a.lang, timestamps=not a.no_timestamps, combine=a.combine,
                    fmt=a.format, output_dir=a.out, delay=a.delay, overwrite=a.overwrite,
-                   log_dir=a.log_dir, source=a.source, cookies_browser=a.cookies_from_browser or "")
+                   log_dir=a.log_dir, source=a.source, cookies_browser=a.cookies_from_browser or "",
+                   cookies_file=a.cookies or "")
     failures = 0
     for url in urls:
         print(f"\nLooking up {url} ...")
@@ -62,8 +65,11 @@ def main(argv=None) -> int:
         def show(v):
             if v.status == "fetching":
                 return
+            if v.status == "waiting":
+                print(f"  [WAIT] {v.index:>3}/{total}  {v.message}", flush=True)
+                return
             line = f"  [{ICONS.get(v.status, v.status)}] {v.index:>3}/{total}  {v.title[:70]}"
-            if v.status in ("no_captions", "error"):
+            if v.status in ("no_captions", "error", "cancelled"):
                 line += f"  ({v.message})"
             print(line, flush=True)
 

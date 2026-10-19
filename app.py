@@ -99,7 +99,8 @@ class Job:
             else:
                 self.stage = "cancelling"   # the runner stops within a moment
 
-    def retry(self, index: int, source: str | None = None, cookies_browser: str | None = None):
+    def retry(self, index: int, source: str | None = None, cookies_browser: str | None = None,
+              cookies_file: str | None = None):
         v = next((v for v in self.collection.videos if v.index == index), None) if self.collection else None
         if not v or not self.runner:
             raise ValueError("Unknown video")
@@ -108,11 +109,17 @@ class Job:
         changed = False
         if source in ("auto", "api", "ytdlp") and source != o.source:
             o.source, changed = source, True
-        if cookies_browser is not None and (cookies_browser in BROWSERS or cookies_browser == "") \
-                and cookies_browser != o.cookies_browser:
-            o.cookies_browser, changed = cookies_browser, True
-        if changed or not isinstance(self.runner.fetcher, SmartFetcher):
-            self.runner.fetcher = SmartFetcher(o.source, o.cookies_browser)
+        if cookies_browser is not None:
+            new_browser = cookies_browser if cookies_browser in BROWSERS else ""
+            new_file = (cookies_file or "").strip().strip('"') if cookies_browser == "file" else ""
+            if (new_browser, new_file) != (o.cookies_browser, o.cookies_file):
+                o.cookies_browser, o.cookies_file, changed = new_browser, new_file, True
+        old = self.runner.fetcher
+        if changed or not isinstance(old, SmartFetcher):
+            self.runner.fetcher = SmartFetcher(o.source, o.cookies_browser, o.cookies_file)
+            # Keep what this run learned: don't go back to an endpoint that already blocked us.
+            self.runner.fetcher.api_blocked = getattr(old, "api_blocked", False)
+        self.runner.rate_limited_streak = 0
         with self.lock:
             self.stop_event = threading.Event()
             self.runner.should_stop = self.stop_event.is_set
@@ -133,13 +140,14 @@ class Job:
     def status(self) -> dict:
         with self.lock:
             vids = [v.to_dict() for v in self.collection.videos] if self.collection else []
-            finished = sum(v["status"] not in ("queued", "fetching", "cancelled") for v in vids)
+            finished = sum(v["status"] not in ("queued", "fetching", "waiting", "cancelled") for v in vids)
             return {
                 "stage": self.stage, "error": self.error,
                 "title": self.collection.title if self.collection else "",
                 "folder": str(self.runner.folder) if self.runner else "",
                 "combined_file": self.result.get("combined_file", ""),
                 "log_file": self.runner.log_file if self.runner else "",
+                "rate_limit_stop": bool(self.runner and self.runner.stopped_for_rate_limit),
                 "log_dir": self.runner.opts.log_dir if self.runner else "",
                 "total": len(vids), "finished": finished, "videos": vids,
             }
@@ -236,7 +244,8 @@ class Handler(BaseHTTPRequestHandler):
                                overwrite=bool(data.get("overwrite", False)),
                                log_dir=(data.get("log_dir") or DEFAULT_LOG_DIR).strip(),
                                source=data.get("source") if data.get("source") in ("auto", "api", "ytdlp") else "auto",
-                               cookies_browser=data.get("cookies_browser") if data.get("cookies_browser") in BROWSERS else "")
+                               cookies_browser=data.get("cookies_browser") if data.get("cookies_browser") in BROWSERS else "",
+                               cookies_file=(data.get("cookies_file") or "").strip().strip('"') if data.get("cookies_browser") == "file" else "")
                 JOB.start(url, opts)
                 return self._json({"ok": True})
             if path in ("/api/cancel", "/api/stop"):
@@ -245,7 +254,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/retry":
                 if JOB.busy():
                     return self._json({"error": "Wait for the current run to finish."}, 409)
-                JOB.retry(int(data["index"]), data.get("source"), data.get("cookies_browser"))
+                JOB.retry(int(data["index"]), data.get("source"), data.get("cookies_browser"), data.get("cookies_file"))
                 return self._json({"ok": True})
             if path == "/api/open":
                 return self._open(data)

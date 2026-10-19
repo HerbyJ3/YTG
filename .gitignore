@@ -5,3 +5,5 @@ __pycache__/
 Thumbs.db
 # your downloaded transcripts never belong in the repo
 Transcript Grabber/
+# a cookies.txt export is your YouTube login: never commit it
+*cookies*.txt

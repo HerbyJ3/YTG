@@ -61,7 +61,8 @@ select:focus{outline:0;border-color:var(--amber)}
 .banner.info{display:block;background:var(--gray-soft);color:#cfd3db}
 .unblock{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px}
 .note{margin:12px 0 0;font-size:12px;color:var(--amber);line-height:1.5}
-.note[hidden]{display:none}
+.note[hidden],#cookiefileRow[hidden]{display:none}
+.chip.waiting{background:var(--amber-soft);color:var(--amber)}
 @media (max-width:560px){.unblock{grid-template-columns:1fr}}
 .logbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:10px;padding:9px 12px;border-radius:8px;background:var(--red-soft);color:#ffb3b5;font-size:13px}
 .logbar[hidden]{display:none}
@@ -239,6 +240,7 @@ select:focus{outline:0;border-color:var(--amber)}
               <option value="edge">Edge cookies</option>
               <option value="chrome">Chrome cookies</option>
               <option value="brave">Brave cookies</option>
+              <option value="file">cookies.txt file</option>
             </select>
           </div>
           <div>
@@ -248,6 +250,13 @@ select:focus{outline:0;border-color:var(--amber)}
               <option value="ytdlp">yt-dlp only</option>
               <option value="api">Library only</option>
             </select>
+          </div>
+        </div>
+        <div id="cookiefileRow" hidden>
+          <label class="lbl" for="cookiefile" style="margin-top:12px">cookies.txt file</label>
+          <div class="field">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>
+            <input id="cookiefile" spellcheck="false" placeholder="C:\Users\you\Downloads\youtube_cookies.txt">
           </div>
         </div>
         <p id="rtnote" class="note" hidden></p>
@@ -277,11 +286,11 @@ const ICON = {
   queued:'<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
   bad:'<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6M15 9l-6 6"/></svg>'
 };
-const LABEL = { saved:"Saved", skipped:"Already saved", fetching:"Fetching", queued:"Queued", no_captions:"No captions", error:"Failed", cancelled:"Cancelled" };
+const LABEL = { saved:"Saved", skipped:"Already saved", fetching:"Fetching", waiting:"Waiting", queued:"Queued", no_captions:"No captions", error:"Failed", cancelled:"Cancelled" };
 const ACTIVE = ["listing","running","cancelling"];
 const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
-function savePrefs(){ try{ localStorage.setItem("tg-prefs", JSON.stringify({lang:$("#lang").value, ts:$("#ts").checked, combine:$("#combine").checked, fmt:state.fmt, out:$("#out").value, logdir:$("#logdir").value, cookies:$("#cookies").value, source:$("#source").value})); }catch(e){} }
+function savePrefs(){ try{ localStorage.setItem("tg-prefs", JSON.stringify({lang:$("#lang").value, ts:$("#ts").checked, combine:$("#combine").checked, fmt:state.fmt, out:$("#out").value, logdir:$("#logdir").value, cookies:$("#cookies").value, cookiefile:$("#cookiefile").value, source:$("#source").value})); }catch(e){} }
 function loadPrefs(){ try{ return JSON.parse(localStorage.getItem("tg-prefs")||"{}"); }catch(e){ return {}; } }
 
 async function api(path, body){
@@ -294,7 +303,7 @@ function banner(msg, kind="err"){ const b=$("#banner"); b.className = msg ? "ban
 
 function setFmt(f){ state.fmt=f; document.querySelectorAll(".pill").forEach(p=>p.setAttribute("aria-pressed", p.dataset.fmt===f)); savePrefs(); }
 document.querySelectorAll(".pill").forEach(p=>p.onclick=()=>setFmt(p.dataset.fmt));
-["#lang","#ts","#combine","#out","#logdir","#cookies","#source"].forEach(s=>$(s).addEventListener("change", savePrefs));
+["#lang","#ts","#combine","#out","#logdir","#cookies","#cookiefile","#source"].forEach(s=>$(s).addEventListener("change", savePrefs));
 
 $("#go").onclick = async () => {
   if (state.running) return;
@@ -302,7 +311,7 @@ $("#go").onclick = async () => {
   const url = $("#url").value.trim();
   if (!url){ banner("Paste a video or playlist URL first."); $("#url").focus(); return; }
   try{
-    await api("/api/start", {url, language:$("#lang").value, timestamps:$("#ts").checked, combine:$("#combine").checked, format:state.fmt, output_dir:$("#out").value, log_dir:$("#logdir").value, cookies_browser:$("#cookies").value, source:$("#source").value});
+    await api("/api/start", {url, language:$("#lang").value, timestamps:$("#ts").checked, combine:$("#combine").checked, format:state.fmt, output_dir:$("#out").value, log_dir:$("#logdir").value, cookies_browser:$("#cookies").value, cookies_file:$("#cookiefile").value, source:$("#source").value});
     state.selected=null; state.lastPreviewKey=""; showPreviewPlaceholder(); $("#logbar").hidden = true;
     startPolling();
   }catch(e){ banner(e.message); }
@@ -351,9 +360,10 @@ function renderLogbar(s){
   const parts = [];
   if (bad) parts.push(`${bad} failed`);
   if (none) parts.push(`${none} had no captions`);
-  const blocked = s.videos.some(v=>v.status==="error" && /blocking requests/i.test(v.message||""));
+  const blocked = s.videos.some(v=>v.status==="error" && /blocking requests|rate-limiting|isn't a bot/i.test(v.message||""));
   let tip = "";
   if (blocked && !$("#cookies").value) tip = " Tip: pick a browser under \u201cIf YouTube blocks you\u201d, then Retry.";
+  if (s.rate_limit_stop) tip = " The run stopped itself so it wouldn't extend YouTube's rate limit. Try again in an hour" + ($("#cookies").value ? "." : ", ideally with cookies on.");
   $("#logmsg").textContent = parts.join(", ") + ". Details saved to the failure log." + tip;
 }
 
@@ -408,7 +418,8 @@ function renderProgress(s){
 }
 
 function chip(v){
-  const ic = v.status==="saved"||v.status==="skipped" ? ICON.saved : v.status==="fetching" ? ICON.fetching : v.status==="queued" ? ICON.queued : ICON.bad;
+  const ic = v.status==="saved"||v.status==="skipped" ? ICON.saved : v.status==="fetching" ? ICON.fetching : (v.status==="queued"||v.status==="waiting") ? ICON.queued : ICON.bad;
+  if (v.status==="waiting"){ const m=/waiting (\d+)s/.exec(v.message||""); if(m) return `<span class="chip waiting" title="${esc(v.message)}">${ic}Waiting ${m[1]}s</span>`; }
   return `<span class="chip ${v.status}" title="${esc(v.message||"")}">${ic}${LABEL[v.status]||v.status}</span>`;
 }
 
@@ -478,7 +489,7 @@ $("#menu").addEventListener("click", async e=>{
     if (b.dataset.act==="preview") selectRow(v.index);
     if (b.dataset.act==="open") await api("/api/open", {path:v.file});
     if (b.dataset.act==="watch") window.open(v.url, "_blank", "noopener");
-    if (b.dataset.act==="retry"){ await api("/api/retry", {index:v.index, source:$("#source").value, cookies_browser:$("#cookies").value}); banner(""); startPolling(); }
+    if (b.dataset.act==="retry"){ await api("/api/retry", {index:v.index, source:$("#source").value, cookies_browser:$("#cookies").value, cookies_file:$("#cookiefile").value}); banner(""); startPolling(); }
   }catch(err){ banner(err.message); }
 });
 
@@ -488,6 +499,9 @@ $("#menu").addEventListener("click", async e=>{
   $("#out").value = p.out || cfg.output_dir;
   $("#logdir").value = p.logdir || cfg.log_dir || "";
   if (p.cookies) $("#cookies").value = p.cookies;
+  if (p.cookiefile) $("#cookiefile").value = p.cookiefile;
+  const syncCookieRow = () => { $("#cookiefileRow").hidden = $("#cookies").value !== "file"; };
+  $("#cookies").addEventListener("change", syncCookieRow); syncCookieRow();
   if (p.source) $("#source").value = p.source;
   if (cfg.js_runtime === "none"){
     const n=$("#rtnote"); n.hidden=false;

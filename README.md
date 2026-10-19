@@ -49,11 +49,21 @@ Each log lists the run's settings and environment (app, Python, and library vers
 
 ### When YouTube blocks you
 
-YouTube sometimes refuses caption requests, even from a home connection; the log will say *"YouTube is blocking requests from this IP."* The app handles most of this on its own:
+YouTube sometimes refuses caption requests, even from a home connection. The failure log tells you which kind of refusal it was, and the app reacts differently to each:
 
-1. **Automatic fallback.** Captions are fetched with a fast, lightweight library first. If YouTube blocks it, the app switches to **yt-dlp**, a full YouTube extractor that's much harder to block, for the rest of the run.
-2. **Browser cookies.** If a video is still blocked, choose a browser under **If YouTube blocks you** (Firefox works most reliably), then press **Retry** on that video. yt-dlp then uses the YouTube sign-in from that browser. Close the browser first; some browsers lock their cookie files while open. Chrome and Edge on Windows encrypt their cookies in a way that can stop this from working, so use Firefox if they fail.
-3. **Wait it out.** Blocks are temporary. Wait 30–60 minutes and run it again; anything already saved is skipped.
+| Log says | What it means | What the app does | What you do |
+|---|---|---|---|
+| *blocking requests from this IP* | The lightweight caption library was blocked | Switches to **yt-dlp**, a full YouTube extractor that's much harder to block, for the rest of the run | Nothing, usually |
+| *rate-limiting caption downloads (HTTP 429)* | Too many caption downloads from your IP recently | Waits 75 s and retries once (shown as **Waiting** in the list), pauses 2 minutes before the next video, and stops the run if two videos in a row are rate-limited | **Stop for at least an hour.** Every attempt restarts YouTube's cooldown. Then turn on cookies and try once. |
+| *confirm this isn't a bot* | YouTube wants a signed-in browser | Fails right away, since retrying without cookies can't help | Turn on cookies, then **Retry** |
+| *Couldn't read … cookies* | The browser's cookie file was locked or encrypted | Fails right away with the reason | Close that browser completely, or use Firefox or a cookies.txt file |
+
+**Turning on cookies.** Requests made with your YouTube sign-in get far higher limits. Under **If YouTube blocks you**, pick one:
+- **Firefox cookies** is the most reliable browser option. Close Firefox first.
+- **Chrome, Edge, or Brave cookies** often fail on Windows, because those browsers encrypt their cookies in a way other programs can't read. When they fail, use a cookies.txt file.
+- **A cookies.txt file** works with any browser. Install a browser extension that exports cookies in Netscape cookies.txt format (yt-dlp's FAQ lists recommended ones), open youtube.com while signed in, export, and paste the file's path into the box that appears. **Treat that file like a password:** it *is* your YouTube login. This repo's `.gitignore` keeps it out of commits.
+
+With cookies on, the app goes straight to yt-dlp, since only yt-dlp can use them.
 
 Also make sure no VPN is on, since VPN addresses are blocked far more often.
 
@@ -67,6 +77,7 @@ python transcript_grabber.py URL --format md --no-timestamps --out "D:\Transcrip
 python transcript_grabber.py URL --combine --lang es
 python transcript_grabber.py --urls-file links.txt
 python transcript_grabber.py URL --cookies-from-browser firefox
+python transcript_grabber.py URL --cookies "C:\Users\you\Downloads\youtube_cookies.txt"
 python transcript_grabber.py URL --source ytdlp
 ```
 

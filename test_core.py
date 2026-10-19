@@ -240,9 +240,103 @@ class Core(unittest.TestCase):
         v = col.videos[0]
         self.assertEqual(v.status, "error")
         self.assertNotIn(": .", v.message)                 # the old "Blocked by YouTube: ." bug
-        self.assertIn("turn on browser cookies", v.message)
+        self.assertIn("Turning on cookies", v.message)
         self.assertIn("Method   : yt-dlp (transcript-api was blocked earlier this run)", text)
         self.assertIn("JS runtime:", text)
+
+    # ---- rate limits (HTTP 429), bot checks, cookies --------------------
+
+    def _rl_runner(self, fetch, n=1, **opt):
+        tmp = tempfile.mkdtemp()
+        slept = []
+        col = T.Collection("rl", [T.Video(i + 1, f"vid{i:08d}", f"V{i}") for i in range(n)], is_playlist=True)
+        r = T.Runner(col, T.Options(output_dir=tmp, log_dir=tmp + "/logs", delay=0, **opt), fetcher=fetch,
+                     sleeper=slept.append)
+        return r, col, slept
+
+    def test_rate_limit_waits_patiently_then_fails(self):
+        calls = []
+
+        def fetch(vid, lang):
+            calls.append(vid)
+            raise T.RateLimited("YouTube rate-limited the caption download (HTTP 429)")
+        r, col, slept = self._rl_runner(fetch, retries=3)
+        r.run()
+        self.assertEqual(len(calls), 2)                     # one patient retry, not three quick ones
+        self.assertGreaterEqual(sum(slept), 75)             # waited >= 75s before it
+        v = col.videos[0]
+        self.assertEqual(v.status, "error")
+        self.assertIn("at least an hour", v.message)
+        self.assertIn("Turning on cookies", v.message)
+
+    def test_rate_limit_cools_down_then_stops_run(self):
+        calls = []
+
+        def fetch(vid, lang):
+            calls.append(vid)
+            raise T.RateLimited("429")
+        r, col, slept = self._rl_runner(fetch, n=5)
+        res = r.run()
+        # 2 videos x 2 attempts, then the run stops itself instead of hammering YouTube
+        self.assertEqual(calls, ["vid00000000"] * 2 + ["vid00000001"] * 2)
+        self.assertTrue(res["rate_limit_stop"])
+        self.assertEqual([v.status for v in col.videos], ["error", "error", "cancelled", "cancelled", "cancelled"])
+        self.assertIn("rate-limiting", col.videos[2].message)
+        self.assertGreaterEqual(sum(slept), 75 + 120 + 75)  # retry wait, cooldown before video 2, its retry wait
+        self.assertIn("STOPPED EARLY", Path(res["log_file"]).read_text())
+
+    def test_success_resets_rate_limit_streak(self):
+        seq = iter([T.RateLimited("429"), T.RateLimited("429"), "ok", T.RateLimited("429"), T.RateLimited("429"), "ok"])
+
+        def fetch(vid, lang):
+            x = next(seq)
+            if isinstance(x, Exception):
+                raise x
+            return fake_fetch(vid, lang)
+        r, col, _ = self._rl_runner(fetch, n=3)
+        res = r.run()
+        self.assertFalse(res["rate_limit_stop"])
+        self.assertEqual([v.status for v in col.videos], ["error", "saved", "error"])
+
+    def test_bot_check_and_cookie_problems_fail_fast(self):
+        for exc, expect in ((T.BotCheck("bot"), "isn't a bot"), (T.CookieProblem("Couldn't read Chrome's cookies"), "Chrome")):
+            calls = []
+
+            def fetch(vid, lang, exc=exc):
+                calls.append(vid)
+                raise exc
+            r, col, slept = self._rl_runner(fetch, retries=3)
+            r.run()
+            self.assertEqual(len(calls), 1, expect)         # no pointless retries
+            self.assertEqual(slept, [])
+            self.assertIn(expect, col.videos[0].message)
+
+    def test_cookies_go_straight_to_ytdlp(self):
+        calls = []
+        f = T.SmartFetcher("auto", cookies_browser="firefox",
+                           api=lambda v, l: calls.append("api"), ytdlp=lambda v, l: calls.append("ytdlp") or fake_fetch(v, l))
+        f("aaaaaaaaaaa")
+        self.assertEqual(calls, ["ytdlp"])
+        self.assertIn("firefox cookies", f.last_source)
+
+    def test_ytdlp_error_mapping(self):
+        class E(Exception):
+            pass
+        cases = [
+            (E("HTTP Error 429: Too Many Requests"), T.RateLimited),
+            (E("ERROR: [youtube] x: Sign in to confirm you're not a bot"), T.BotCheck),
+            (E("Could not copy Chrome cookie database. See https://github.com/yt-dlp/yt-dlp/issues/7271"), T.CookieProblem),
+            (E("Failed to decrypt with DPAPI"), T.CookieProblem),
+            (E("HTTP Error 403: Forbidden"), T.Blocked),
+            (E("ERROR: [youtube] x: Private video"), T.NoCaptions),
+        ]
+        for err, want in cases:
+            with self.assertRaises(want, msg=str(err)):
+                T._raise_mapped(err, "caption download", "chrome")
+        try:
+            T._raise_mapped(E("HTTP Error 429"), "caption download")
+        except T.RateLimited as e:
+            self.assertIn("caption download", str(e))
 
     def test_first_line_skips_blank_lines(self):
         self.assertEqual(T._first_line(Exception("\n\n  Could not retrieve\nmore")), "Could not retrieve")
